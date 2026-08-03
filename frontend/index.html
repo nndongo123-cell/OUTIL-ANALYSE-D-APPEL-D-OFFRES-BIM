@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Outil d’analyse BIM</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <p class="eyebrow">ANALYSE D’APPEL D’OFFRES BIM</p>
+      <h1>Préparer une réponse BIM claire, traçable et maîtrisée</h1>
+      <p class="intro">Chargez les documents du marché, sélectionnez le lot puis complétez l’<span class="static-term" data-term="Auto-évaluation">auto-évaluation</span>. Le moteur produit deux livrables complémentaires : un dashboard d’analyse et un plan d’action opérationnel.</p>
+    </header>
+
+    <form id="analysis-form" novalidate>
+      <section class="panel">
+        <div class="section-title"><span>1</span><h2>Documents et contexte</h2></div>
+        <div class="grid two">
+          <label class="field">
+            <span><span class="static-term" data-term="Convention BIM">Convention BIM</span> <b>*</b></span>
+            <input type="file" name="convention" accept="application/pdf,.pdf" required>
+            <small id="convention-file-status">PDF obligatoire</small>
+          </label>
+          <label class="field">
+            <span><span class="static-term" data-term="CCTP">CCTP du lot</span></span>
+            <input type="file" name="cctp" accept="application/pdf,.pdf">
+            <small id="cctp-file-status">PDF facultatif, mais recommandé</small>
+          </label>
+          <label class="field">
+            <span>Entreprise</span>
+            <input type="text" name="entreprise" placeholder="Nom de l’entreprise">
+          </label>
+          <label class="field">
+            <span>Lot analysé <b>*</b></span>
+            <input type="text" name="lot" placeholder="Ex. Façade et bardage" required>
+          </label>
+          <label class="field">
+            <span>Sigle affiché en en-tête des documents</span>
+            <input type="text" name="marque" placeholder="Ex. BNN (par défaut : nom de l’entreprise)">
+          </label>
+          <label class="field">
+            <span>Logo (facultatif, inséré dans tous les documents)</span>
+            <input type="file" name="logo" accept="image/png,image/jpeg,.png,.jpg,.jpeg">
+            <small>PNG ou JPEG. Remplace le sigle texte si fourni.</small>
+          </label>
+          <label class="check-field">
+            <input id="sans-eval" type="checkbox" name="sans_eval">
+            <span><strong>Test rapide sans auto-évaluation</strong><small>Utile pour vérifier d'abord la lecture des PDF et la génération du dashboard.</small></span>
+          </label>
+        </div>
+      </section>
+
+      <section class="panel" id="questionnaire-panel">
+        <div class="section-title"><span>2</span><h2><span class="static-term" data-term="Auto-évaluation">Auto-évaluation</span> de l’entreprise</h2></div>
+        <p class="help">Chaque réponse est enregistrée par son identifiant. Les blocs sont présentés par numéro croissant. La capacité est évaluée indépendamment du statut contractuel, hors exigences explicitement exclues.</p>
+        <div id="questionnaire-status" class="notice">Chargement du questionnaire…</div>
+        <div id="questionnaire"></div>
+      </section>
+
+      <section class="panel submit-panel">
+        <div>
+          <h2>Lancer l’analyse</h2>
+          <p>Les fichiers sont traités par le backend local. Le navigateur mémorise les champs, les réponses et les PDF sélectionnés pour éviter de recommencer après une actualisation.</p>
+        </div>
+        <div class="submit-actions">
+          <button id="clear-memory-button" class="secondary-button" type="button">Effacer les données mémorisées</button>
+          <button id="submit-button" type="submit">Analyser les documents</button>
+        </div>
+      </section>
+    </form>
+
+    <section id="progress" class="panel result-panel hidden" aria-live="polite"></section>
+
+    <section id="history-panel" class="panel history-panel">
+      <div class="history-heading">
+        <div>
+          <p class="eyebrow">Suivi local</p>
+          <h2>Historique des analyses</h2>
+          <p>Les analyses restent disponibles après fermeture du navigateur et redémarrage des serveurs.</p>
+        </div>
+        <button id="refresh-history" class="secondary-button" type="button">Actualiser</button>
+      </div>
+      <div id="history-status" class="notice">Chargement de l’historique…</div>
+      <div id="history-list" class="history-list"></div>
+    </section>
+  </main>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
