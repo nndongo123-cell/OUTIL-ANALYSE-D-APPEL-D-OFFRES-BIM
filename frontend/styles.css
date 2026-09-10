@@ -115,3 +115,40 @@ body,input,select,button,textarea{font-family:Calibri,Carlito,"Segoe UI",Arial,s
 .history-actions a{display:flex;align-items:center;justify-content:center;text-align:center;min-height:34px}
 .deliverable .actions a{flex:1 1 190px;text-align:center}
 @media(max-width:760px){.term-bubble{position:fixed;left:12px;right:12px;bottom:12px;width:auto}.history-actions{grid-template-columns:1fr}.deliverable .actions a{flex-basis:100%}}
+
+
+/* Cycle 50 — vérification intégrée avant analyse */
+.precheck-overlay{position:fixed;inset:0;z-index:1000;background:rgba(7,28,36,.62);display:flex;align-items:center;justify-content:center;padding:24px}
+.precheck-dialog{width:min(650px,100%);background:#fff;border-top:5px solid #A1003D;box-shadow:0 18px 55px rgba(7,28,36,.28);color:#071C24}
+.precheck-head{padding:22px 24px 14px;border-bottom:1px solid #D7E1E6}
+.precheck-kicker{margin:0 0 4px;color:#A1003D;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.06em}
+.precheck-head h2{margin:0;font-family:"Calibri Light",Calibri,Carlito,"Segoe UI",Arial,sans-serif;font-size:24px;font-weight:700;color:#071C24}
+.precheck-body{padding:18px 24px 20px}
+.precheck-summary{display:grid;grid-template-columns:180px 1fr;border:1px solid #D7E1E6;margin-bottom:14px}
+.precheck-summary>div{display:contents}
+.precheck-summary span,.precheck-summary strong{padding:8px 10px;border-bottom:1px solid #E7EEF2}
+.precheck-summary>div:last-child span,.precheck-summary>div:last-child strong{border-bottom:0}
+.precheck-summary span{background:#F7FAFC;color:#667985;font-size:10px;font-weight:800;text-transform:uppercase}
+.precheck-summary strong{font-size:12px;font-weight:700;color:#071C24}
+.precheck-status.ok{color:#176B55}.precheck-status.warning{color:#A1003D}.precheck-status.neutral{color:#A66A12}
+.precheck-warning{margin:0 0 14px;padding:10px 12px;background:#FFF6F1;border-left:3px solid #A66A12;color:#664514;font-size:12px;line-height:1.5}
+.precheck-check{display:flex;gap:10px;align-items:flex-start;padding:11px 12px;border:1px solid #D7E1E6;background:#F7FAFC;font-size:12px;line-height:1.45;cursor:pointer}
+.precheck-check+.precheck-check{margin-top:9px}.precheck-check input{margin-top:2px;accent-color:#A1003D}
+.precheck-check-warning{border-color:#D9A2B6;background:#FFF2F7}
+.precheck-actions{display:flex;justify-content:flex-end;gap:9px;padding:14px 24px 20px;border-top:1px solid #D7E1E6}
+.precheck-actions button{min-width:135px}.precheck-launch{background:#A1003D!important;border-color:#A1003D!important;color:#fff!important}
+.precheck-launch:disabled{opacity:.38!important;cursor:not-allowed!important}
+@media(max-width:620px){.precheck-overlay{padding:10px}.precheck-summary{grid-template-columns:1fr}.precheck-summary>div{display:block;border-bottom:1px solid #E7EEF2}.precheck-summary span,.precheck-summary strong{display:block;border-bottom:0}.precheck-summary>div:last-child{border-bottom:0}.precheck-actions{flex-direction:column-reverse}.precheck-actions button{width:100%}}
+
+
+/* DEV05 — gestion des documents et contrôle de cohérence avant analyse */
+.file-status-row{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}.file-status-row small{flex:1 1 auto}.file-clear-button{flex:0 0 auto;background:#fff!important;color:#667985!important;border:1px solid #C9D6DE!important;padding:5px 8px!important;font-size:10px!important;line-height:1.2!important}.file-clear-button:hover{color:#A1003D!important;border-color:#A1003D!important}.file-clear-button:disabled{opacity:.48;cursor:not-allowed!important;color:#8A9AA4!important;border-color:#D7E1E6!important;background:#F7FAFC!important}.precheck-dialog{width:min(780px,100%)}.precheck-docs{border:1px solid #D7E1E6;margin:0 0 14px}.precheck-docs-title{padding:8px 10px;background:#F7FAFC;color:#667985;font-size:10px;font-weight:800;text-transform:uppercase}.precheck-doc-row{display:grid;grid-template-columns:100px minmax(0,1fr) 120px;gap:8px;align-items:start;padding:8px 10px;border-top:1px solid #E7EEF2;font-size:11px}.precheck-doc-row strong{font-size:11px}.precheck-doc-row small{color:#667985;line-height:1.4}.precheck-alerts{display:grid;gap:8px;margin-bottom:14px}.precheck-warning.danger{background:#FFF2F7;border-left-color:#A1003D;color:#7A1235;margin:0}.precheck-warning.info{background:#F2F7FA;border-left-color:#1F5D8C;color:#314A59;margin:0}@media(max-width:620px){.file-status-row{display:block}.file-clear-button{margin-top:6px}.precheck-doc-row{grid-template-columns:1fr}.precheck-doc-row span{display:block}}
+
+
+/* DEV07 — contrôle préalable visible et obligatoire */
+.live-precheck{margin-top:16px;padding:12px 14px;border:1px solid #C9D6DE;border-left:5px solid #A66A12;background:#FFF9F2;display:flex;align-items:center;justify-content:space-between;gap:16px}
+.live-precheck>div{display:grid;gap:3px}.live-precheck strong{font-size:12px;color:#071C24}.live-precheck span{font-size:11px;line-height:1.45;color:#667985}
+.live-precheck.ok{border-left-color:#176B55;background:#F1F8F5}.live-precheck.warning{border-left-color:#A66A12;background:#FFF9F2}.live-precheck.danger{border-left-color:#A1003D;background:#FFF2F7}.live-precheck.checking{border-left-color:#1F5D8C;background:#F2F7FA}
+.live-precheck.danger span{color:#7A1235}.live-precheck.warning span{color:#664514}.live-precheck.ok span{color:#176B55}
+.live-precheck button{flex:0 0 auto}.precheck-blocking-message{padding:12px 14px;border:1px solid #D9A2B6;background:#FFF2F7;color:#7A1235;font-size:12px;font-weight:700;line-height:1.45}
+@media(max-width:760px){.live-precheck{align-items:stretch;flex-direction:column}.live-precheck button{width:100%}}

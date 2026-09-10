@@ -16,33 +16,11 @@ def clean(value: Any) -> str:
 QUESTION_OVERRIDES: Dict[str, Dict[str, Any]] = {}
 
 
-FALLBACK_GLOSSARY: Dict[str, Dict[str, Any]] = {
-    "BIM": {"definition": "Méthode collaborative fondée sur une maquette numérique enrichie de données.", "aliases": ["Building Information Modeling"]},
-    "Convention BIM": {"definition": "Document contractuel qui fixe les règles BIM du projet : rôles, logiciels, formats, nommage, échanges, jalons et livrables.", "aliases": ["charte BIM", "protocole BIM"]},
-    "CCTP": {"definition": "Cahier des Clauses Techniques Particulières : document qui décrit les prestations et exigences techniques applicables au lot.", "aliases": ["CCTP du lot"]},
-    "DPGF": {"definition": "Décomposition du Prix Global et Forfaitaire : détail chiffré des prestations composant l'offre.", "aliases": ["bordereau de prix", "DPGF numérique"]},
-    "BIM Manager": {"definition": "Responsable du processus BIM du projet, de la convention, de la coordination et du contrôle des échanges.", "aliases": ["responsable BIM du projet"]},
-    "Coordinateur BIM": {"definition": "Référent chargé de coordonner les modèles et de contrôler la qualité BIM d'une discipline ou d'un groupement.", "aliases": ["coordonnateur BIM"]},
-    "IFC": {"definition": "Format ouvert et interopérable d'échange de maquettes numériques, indépendant du logiciel auteur.", "aliases": ["format IFC", "export IFC"]},
-    "Format natif": {"definition": "Format propriétaire du logiciel auteur, par exemple RVT pour Revit ou PLN pour Archicad.", "aliases": ["natif", "fichier natif"]},
-    "CDE": {"definition": "Environnement commun de données utilisé pour déposer, versionner, valider et partager les documents et maquettes du projet.", "aliases": ["plateforme collaborative", "plateforme commune de dépôt", "environnement commun de données"]},
-    "DOE numérique": {"definition": "Dossier des ouvrages exécutés remis sous forme numérique avec les plans, données et informations de recollement.", "aliases": ["DOE BIM", "DOE"]},
-    "AIM": {"definition": "Asset Information Model : modèle d'information destiné à l'exploitation et à la maintenance de l'ouvrage.", "aliases": ["Asset Information Model", "modèle d'information de l'actif"]},
-    "GMAO": {"definition": "Gestion de maintenance assistée par ordinateur : outil qui exploite les données d'actifs pour organiser la maintenance.", "aliases": ["gestion de maintenance assistée par ordinateur"]},
-    "LOD": {"definition": "Niveau de développement géométrique et informationnel attendu pour les objets de la maquette.", "aliases": ["niveau de développement"]},
-    "LOIN": {"definition": "Level of Information Need : niveau d'information nécessaire pour un usage et une phase donnés.", "aliases": ["niveau d'information nécessaire", "liste des informations à fournir"]},
-    "BCF": {"definition": "Format ouvert permettant d'échanger des remarques, réserves et sujets de coordination liés à une maquette BIM.", "aliases": ["BIM Collaboration Format"]},
-    "Revit": {"definition": "Logiciel de conception et de production de maquettes BIM édité par Autodesk.", "aliases": ["RVT"]},
-    "ArchiCAD": {"definition": "Logiciel de conception et de production de maquettes BIM édité par Graphisoft.", "aliases": ["Archicad", "PLN"]},
-    "Allplan": {"definition": "Logiciel de conception et de production BIM utilisé notamment en architecture et en ingénierie.", "aliases": []},
-    "Tekla": {"definition": "Logiciel BIM spécialisé dans la modélisation détaillée des structures et assemblages.", "aliases": ["Tekla Structures"]},
-    "DWG": {"definition": "Format de dessin CAO couramment utilisé pour les plans 2D et certains échanges de géométrie.", "aliases": ["format DWG"]},
-    "BIM 4D": {"definition": "Association de la maquette au planning afin de représenter le phasage dans le temps.", "aliases": ["4D", "phasage 4D"]},
-    "BIM 5D": {"definition": "Association de la maquette aux quantités et aux coûts pour contribuer au chiffrage et au suivi économique.", "aliases": ["5D", "chiffrage 5D"]},
-    "Profil du lot": {"definition": "Mode de participation du lot au processus BIM : production de maquette ou contribution principalement documentaire.", "aliases": ["lot documentaire", "producteur de maquette"]},
-    "Nomenclature BIM": {"definition": "Tableau structuré listant les objets et leurs propriétés, généré depuis une maquette ou renseigné selon un modèle imposé.", "aliases": ["nomenclature", "tableau de paramètres"]},
-    "As-built": {"definition": "État réellement exécuté et relevé en fin de chantier, utilisé pour mettre à jour les plans et données de recollement.", "aliases": ["tel que construit", "recollement"]},
-}
+FALLBACK_GLOSSARY: Dict[str, Dict[str, Any]] = {}
+
+# Le glossaire métier est fourni exclusivement par 40_Glossaire.
+# Aucun terme, synonyme ni définition de secours n'est défini dans Python.
+
 
 
 def normalize_questions_dataframe(df):
@@ -85,22 +63,10 @@ def glossary_entries_from_dataframe(df) -> List[Dict[str, Any]]:
                 "term": term,
                 "definition": definition,
                 "source": clean(row.get("source")),
+                "practice": clean(row.get("explication_tpe_pme")),
                 "category": clean(row.get("categorie")),
                 "aliases": sorted({a for a in aliases if a and a.casefold() != term.casefold()}, key=len, reverse=True),
             }
-    for term, cfg in FALLBACK_GLOSSARY.items():
-        key = term.casefold()
-        if key not in entries:
-            entries[key] = {
-                "term": term,
-                "definition": clean(cfg.get("definition")),
-                "source": "Glossaire de l'outil",
-                "category": "",
-                "aliases": list(cfg.get("aliases") or []),
-            }
-        else:
-            existing = entries[key]
-            existing["aliases"] = sorted(set(existing.get("aliases", [])) | set(cfg.get("aliases") or []), key=len, reverse=True)
     return sorted(entries.values(), key=lambda item: item["term"].casefold())
 
 
@@ -115,6 +81,7 @@ def glossary_lookup(entries: Iterable[Mapping[str, Any]]) -> Dict[str, Dict[str,
             "term": term,
             "definition": definition,
             "source": clean(raw.get("source") or raw.get("source_excel")),
+            "practice": clean(raw.get("practice") or raw.get("explication_tpe_pme")),
             "category": clean(raw.get("category") or raw.get("categorie")),
             "aliases": list(raw.get("aliases") or []),
         }

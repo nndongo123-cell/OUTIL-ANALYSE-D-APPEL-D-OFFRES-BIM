@@ -5,7 +5,7 @@ Dashboard HTML — outil BIM v1
 Style : dossier d’ingénierie, titres Calibri Light et contenu Calibri Regular.
 """
 import html, json, re
-from content_rules import FALLBACK_GLOSSARY, glossary_lookup
+from content_rules import glossary_lookup
 from typing import Dict, List
 
 def esc(s) -> str:
@@ -29,8 +29,6 @@ def _build_glossaire_lookup(glossaire_complet: List[Dict]) -> Dict[str, Dict]:
             "category": g.get("categorie") or "",
             "aliases": aliases,
         })
-    for term, cfg in FALLBACK_GLOSSARY.items():
-        entries.append({"term": term, "definition": cfg.get("definition", ""), "source": "Glossaire de l'outil", "aliases": cfg.get("aliases", [])})
     raw = glossary_lookup(entries)
     # Adapter la structure attendue par tip().
     return {key: {
@@ -177,6 +175,32 @@ def _render_docs_analyses(meta: dict, tip=None) -> str:
     else:
         lignes.append('''<div style="font-size:10.5px;color:#aaa;font-style:italic">CCTP non fourni</div>''')
 
+    # CCAP : utilisé pour le repérage de la hiérarchie documentaire, pas pour
+    # qualifier les exigences BIM de chaque bloc.
+    ccap = meta.get("ccap_reperage") or {}
+    if ccap.get("provided"):
+        messages = meta.get("messages") or {}
+        ccap_label = esc(messages.get("dashboard_ccap_doc_label") or "CCAP")
+        ccap_role = esc(messages.get("dashboard_ccap_doc_role") or "Utilisé pour le repérage de la hiérarchie documentaire")
+        ccap_page = esc(ccap.get("page") or "")
+        page_info = f" · source p.{ccap_page}" if ccap_page else ""
+        lignes.append(f'''<div style="margin-top:9px;padding-top:9px;border-top:0.5px solid #eee">
+        <div style="font-size:11px;font-weight:600;color:#071C24;margin-bottom:3px">{ccap_label}</div>
+        <div style="font-size:10px;color:#666">{ccap_role}{page_info}</div>
+      </div>''')
+
+    # Cycle 50 : la traçabilité du Dashboard reflète le corpus réel de la
+    # révision courante. Toute pièce complémentaire effectivement analysée est
+    # listée ici ; les noms viennent du manifeste de job, jamais d'une liste
+    # codée en dur de types de documents.
+    supplements = [str(x or "").strip() for x in (meta.get("supplementary_documents") or []) if str(x or "").strip()]
+    for idx, name in enumerate(supplements, start=1):
+        lignes.append(f'''<div style="margin-top:9px;padding-top:9px;border-top:0.5px solid #eee">
+        <div style="font-size:11px;font-weight:600;color:#071C24;margin-bottom:3px">Pièce complémentaire analysée</div>
+        <div style="font-size:10px;color:#888;margin-bottom:1px">{esc(name)}</div>
+        <div style="font-size:10px;color:#666">Intégrée au corpus de la révision courante</div>
+      </div>''')
+
     return "\n".join(lignes)
 
 
@@ -223,6 +247,8 @@ def build_dashboard(
     conv_text: str = "",
     conv_b64: str = "",
     cctp_b64: str = "",
+    ccap_b64: str = "",
+    supplement_b64: Dict = None,
     pdf_filename: str = "",
     glossaire_complet: List[Dict] = None,
 ) -> str:
@@ -230,7 +256,13 @@ def build_dashboard(
     from datetime import datetime
     from bim_model import block_sort_key, ensure_public_model
 
-    ensure_public_model(resultats_lecture, scores_eval, textes_reponse, lot=str(meta.get("lot", "")), axes_config=meta.get("axes_config"))
+    ensure_public_model(
+        resultats_lecture, scores_eval, textes_reponse,
+        lot=str(meta.get("lot", "")),
+        axes_config=meta.get("axes_config"),
+        restitution_rules=meta.get("restitution_rules"),
+        messages=meta.get("messages"),
+    )
     lookup = _build_glossaire_lookup(glossaire_complet if glossaire_complet is not None else glossaire)
     tip = _make_tip(lookup)
     autotip = _make_autotip(lookup, tip)
@@ -248,21 +280,33 @@ def build_dashboard(
             page = esc(ev.get("page", "Non précisée"))
             lot = esc(ev.get("lot", "Lot analysé"))
             text = rich(ev.get("text", ""))
-            kind = "cctp" if "CCTP" in ev.get("source", "").upper() else "conv"
+            kind = str(ev.get("kind") or "conv")
             page_num = re.search(r"\d+", str(ev.get("page", "")))
             button = ""
             if page_num:
                 button = f'<button type="button" class="source-button" data-pdf="{kind}" data-page="{page_num.group(0)}">Ouvrir la source p.{page_num.group(0)}</button>'
+            qualification = esc(ev.get("qualification") or "")
             cards.append(f'''<article class="proof-card">
-              <div class="proof-meta"><b>{source}</b><span>Page {page}</span><span>Portée : {lot}</span><span>Qualification : extrait ciblé retenu</span></div>
+              <div class="proof-meta"><b>{source}</b><span>Page {page}</span><span>Portée : {lot}</span><span>Qualification : {qualification}</span></div>
               <blockquote>{text}</blockquote>{button}
             </article>''')
         return "".join(cards)
 
     def block_html(block_id: str, result: Dict) -> str:
-        block = result.get("bloc") or {}
+        block = result.get("bloc")
+        if block is None:
+            block = {}
+        messages = meta.get("messages") or {}
+        global_capacity_label = str(messages.get("ui_capacity_global_label") or "Capacité générale")
+        requirement_coverage_title = str(messages.get("ui_requirement_coverage_label") or "Couverture de l'exigence")
         pct = result.get("public_capacity_pct")
         prep = f"{pct} %" if isinstance(pct, (int, float)) else "Non chiffrée"
+        has_requirement_coverage = bool(result.get("public_requirement_question_ids"))
+        requirement_coverage = str(result.get("public_requirement_coverage_label") or "")
+        coverage_html = (
+            f'<div class="coverage-box"><b>{esc(requirement_coverage_title)}</b><p>{esc(requirement_coverage)}</p></div>'
+            if has_requirement_coverage else ""
+        )
         demand = result.get("public_demand") or block.get("lecture_entreprise") or block.get("description_convention") or result.get("conclusion") or "Exigence à analyser."
         question = result.get("public_question") or ""
         action_items = result.get("public_action_items") or [{"text": action, "origin": ""} for action in (result.get("public_actions") or [])]
@@ -270,8 +314,14 @@ def build_dashboard(
         for item in action_items:
             origin = item.get("origin", "") if isinstance(item, dict) else ""
             text = item.get("text", "") if isinstance(item, dict) else str(item)
+            phase = item.get("phase_short") or item.get("phase_label") if isinstance(item, dict) else ""
+            phase_note = item.get("phase_note", "") if isinstance(item, dict) else ""
+            phase_color = item.get("phase_color", "") if isinstance(item, dict) else ""
             origin_html = f'<small>Origine : {rich(origin)}</small>' if origin else ""
-            rendered_actions.append(f'<li><span>{rich(text)}</span>{origin_html}</li>')
+            phase_style = f' style="border-color:{esc(phase_color)};color:{esc(phase_color)}"' if phase_color else ""
+            phase_html = f'<small class="action-phase"{phase_style}>{esc(phase)}</small>' if phase else ""
+            note_html = f'<small>{rich(phase_note)}</small>' if phase_note else ""
+            rendered_actions.append(f'<li>{phase_html}<span>{rich(text)}</span>{note_html}{origin_html}</li>')
         actions_html = "".join(rendered_actions)
         question_html = f'<div class="question-box"><b>Question à transmettre</b><p>{rich(question)}</p></div>' if question else ""
         contradictions = result.get("contradictions") or []
@@ -289,19 +339,29 @@ def build_dashboard(
             # réponse à formuler : une carte à 4 sections donnerait l'impression
             # trompeuse qu'il reste beaucoup à analyser. Une seule section
             # explique pourquoi et rappelle la seule vigilance utile.
-            reason = result.get("public_response_text") or result.get("conclusion") or "Non identifiée comme exigence applicable au lot dans les documents analysés."
+            reason = result.get("public_demand") or result.get("public_response_text") or result.get("conclusion") or ""
             first_action = action_items[0] if action_items else None
-            action_text = (first_action.get("text") if isinstance(first_action, dict) else str(first_action)) if first_action else "Vérifier, avant remise de l'offre, qu'aucun ordre écrit ou additif ne réintroduit cette prestation."
-            action_origin = (first_action.get("origin", "") if isinstance(first_action, dict) else "") if first_action else ""
+            action_text = (first_action.get("text") if isinstance(first_action, dict) else str(first_action)) if first_action else ""
+            evidence = result.get("public_evidence") or []
+            if evidence:
+                first_ev = evidence[0]
+                ev_source = str(first_ev.get("source") or "").strip()
+                ev_page = str(first_ev.get("page") or "").strip()
+                action_origin = f"{ev_source} p.{ev_page}" if ev_source and ev_page else ev_source
+            else:
+                action_origin = (first_action.get("origin", "") if isinstance(first_action, dict) else "") if first_action else ""
+            action_html = f'<p class="excluded-check">{rich(action_text)}</p>' if action_text else ""
+            proof_html = f'<section class="proofs"><h3>Preuve ayant conduit à l’exclusion</h3>{evidence_html(result)}</section>' if evidence else ""
             body = f'''<div class="req-body">
             <div class="req-meta-strip">
               <div><span>Priorité</span><b>{esc(result.get('public_priority'))}</b></div>
               <div><span>Décision</span><b>{esc(result.get('public_decision'))}</b></div>
-              <div><span>Origine</span><b>{esc(action_origin or 'À confirmer')}</b></div>
+              <div><span>Origine</span><b>{esc(action_origin)}</b></div>
             </div>
             <section class="excluded-note"><h3>Pourquoi ce bloc est exclu</h3><p>{rich(reason)}</p>
-              <p class="excluded-check">{rich(action_text)}</p>
+              {action_html}
             </section>
+            {proof_html}
           </div>'''
             return f'''<details class="req-card" data-block="{esc(block_id)}" data-status="{status_class}">
           <summary class="req-summary">
@@ -329,7 +389,7 @@ def build_dashboard(
             </div>
             <div class="detail-grid">
               <section><h3>Ce qui est demandé</h3><p>{rich(demand)}</p></section>
-              <section><h3>Ce que je suis capable de faire en ce moment</h3><p><b>{esc(result.get('public_capacity_label'))}</b></p><p>{rich(result.get('public_capacity_strength'))}</p>{f'<div class="gap-box"><b>Point à renforcer</b><p>{rich(result.get("public_capacity_gap"))}</p></div>' if result.get('public_capacity_gap') else ''}</section>
+              <section><h3>Ce que je suis capable de faire en ce moment</h3><p><small class="capacity-kicker">{esc(global_capacity_label)}</small><br><b>{esc(result.get('public_capacity_label'))}</b></p>{coverage_html}<p>{rich(result.get('public_capacity_strength'))}</p>{f'<div class="gap-box"><b>Point à renforcer</b><p>{rich(result.get("public_capacity_gap"))}</p></div>' if result.get('public_capacity_gap') else ''}</section>
               <section><h3>Ce que je dois répondre</h3><span class="response-label">{esc(result.get('public_response_label'))}</span><blockquote>{rich(result.get('public_response_text'))}</blockquote></section>
               <section><h3>Ce que je dois faire pour être conforme</h3><ul class="action-list">{actions_html}</ul>{question_html}</section>
             </div>
@@ -338,12 +398,26 @@ def build_dashboard(
           </div>
         </details>'''
 
-    group_specs = [
-        ("CONFIRMED", "Confirmées pour le lot", "Exigences directement applicables et appuyées par une preuve recevable.", True),
-        ("CLARIFY", "À confirmer pour le lot", "Périmètre ou contenu à sécuriser par écrit avant engagement.", True),
-        ("UNDEMONSTRATED", "Non démontrées dans les documents", "Aucune preuve ciblée recevable n’établit actuellement l’exigence pour le lot.", True),
-        ("EXCLUDED", "Exclues ou non applicables", "Aucun engagement à prendre, sauf ordre écrit ou modification contractuelle.", False),
-    ]
+    status_axis = (meta.get("axes_config") or {}).get("statut_public") or {}
+    group_specs = []
+    for key, cfg in sorted(status_axis.items(), key=lambda item: int((item[1] or {}).get("ordre", 9999))):
+        label = (cfg or {}).get("label_court") or (cfg or {}).get("label") or key
+        description = (cfg or {}).get("note_restitution") or (cfg or {}).get("description") or ""
+        group_specs.append((key, label, description, key != "EXCLUDED"))
+    if not group_specs:
+        seen_statuses = {}
+        for result in resultats_lecture.values():
+            key = result.get("public_status_key")
+            if key and key not in seen_statuses:
+                seen_statuses[key] = (
+                    result.get("public_status_label") or key,
+                    "",
+                    int(result.get("public_group_order") or 9999),
+                )
+        group_specs = [
+            (key, data[0], data[1], key != "EXCLUDED")
+            for key, data in sorted(seen_statuses.items(), key=lambda item: item[1][2])
+        ]
     groups_html = []
     for key, label, description, opened in group_specs:
         items = [(bid, res) for bid, res in resultats_lecture.items() if res.get("public_status_key") == key]
@@ -362,6 +436,24 @@ def build_dashboard(
     undem = sum(1 for r in resultats_lecture.values() if r.get("public_status_key") == "UNDEMONSTRATED")
     excluded = sum(1 for r in resultats_lecture.values() if r.get("public_status_key") == "EXCLUDED")
 
+    _messages = meta.get("messages") or {}
+    _metric_values = {
+        "CONFIRMED": confirmed,
+        "CLARIFY": clarify,
+        "UNDEMONSTRATED": undem,
+        "EXCLUDED": excluded,
+    }
+    _metric_classes = {"CLARIFY": " alert"}
+    _metric_parts = []
+    for _key in ("CONFIRMED", "CLARIFY", "UNDEMONSTRATED", "EXCLUDED"):
+        _label = str(_messages.get(f"dashboard_metric_{_key}_label") or "").strip()
+        _note = str(_messages.get(f"dashboard_metric_{_key}_note") or "").strip()
+        _metric_parts.append(
+            f'<div class="metric{_metric_classes.get(_key, "")}"><b>{_metric_values[_key]}</b>'
+            f'<span>{esc(_label)}</span><small>{esc(_note)}</small></div>'
+        )
+    metrics_html = "".join(_metric_parts)
+
     nonexcluded = [(bid, r) for bid, r in resultats_lecture.items() if r.get("public_status_key") != "EXCLUDED"]
     evaluated = [(bid, r) for bid, r in resultats_lecture.items() if r.get("public_capacity_pct") is not None]
     eval_pct = round(100 * len(evaluated) / len(nonexcluded)) if nonexcluded else 100
@@ -369,15 +461,37 @@ def build_dashboard(
     action_count = sum(len(r.get("public_actions") or []) for _, r in nonexcluded)
 
     # Radar : tous les blocs évalués, triés par numéro croissant.
+    # L'échelle et le nombre minimal de blocs viennent de 05_Parametres_Moteur.
+    _params = meta.get("engine_params") or {}
+    try:
+        radar_max = float(_params.get("radar_score_max"))
+    except (TypeError, ValueError):
+        radar_max = 0.0
+    try:
+        radar_min_blocks = int(_params.get("radar_min_blocs"))
+    except (TypeError, ValueError):
+        radar_min_blocks = 0
+    raw_graduations = _params.get("radar_graduations") or []
+    if isinstance(raw_graduations, str):
+        raw_graduations = [v.strip() for v in raw_graduations.split(";") if v.strip()]
+    radar_graduations = []
+    for raw in raw_graduations:
+        try:
+            tick = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if radar_max > 0 and 0 < tick <= radar_max:
+            radar_graduations.append(tick)
     radar_items = sorted(evaluated, key=lambda item: block_sort_key(item[0]))
-    if len(radar_items) >= 3:
+    if radar_max > 0 and radar_min_blocks > 0 and len(radar_items) >= radar_min_blocks:
         cx, cy, radius = 220, 195, 142
         n_axes = len(radar_items)
         def point(index: int, ratio: float):
             angle = -math.pi / 2 + (2 * math.pi * index / n_axes)
             return cx + radius * ratio * math.cos(angle), cy + radius * ratio * math.sin(angle)
         grids = []
-        for level in (0.2, 0.4, 0.6, 0.8, 1.0):
+        grid_levels = [tick / radar_max for tick in radar_graduations] or [1.0]
+        for level in grid_levels:
             pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in (point(i, level) for i in range(n_axes)))
             grids.append(f'<polygon points="{pts}" fill="none" stroke="#D9E3E9" stroke-width="1"/>')
         spokes, labels, dots = [], [], []
@@ -389,17 +503,20 @@ def build_dashboard(
             anchor = "middle" if abs(dx-cx) < 10 else ("end" if dx < cx else "start")
             spokes.append(f'<line x1="{cx}" y1="{cy}" x2="{x:.1f}" y2="{y:.1f}" stroke="#D9E3E9" stroke-width="1"/>')
             labels.append(f'<text x="{dx:.1f}" y="{dy:.1f}" text-anchor="{anchor}" dominant-baseline="middle" font-family="Calibri,Arial,sans-serif" font-size="10" font-weight="700" fill="#17232B">{esc(bid)}</text>')
-            px, py = point(i, value / 100)
+            px, py = point(i, max(0.0, min(radar_max, value)) / radar_max)
             data_points.append(f"{px:.1f},{py:.1f}")
             dots.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="4" fill="#1F5D8C" stroke="#fff" stroke-width="1.5"><title>{esc(bid)} : {value:g} %</title></circle>')
-        radar_svg = f'''<svg viewBox="0 0 440 405" role="img" aria-label="Diagramme radar des capacités déclarées" class="radar-svg">
+        _radar_aria = str(_messages.get("dashboard_radar_aria_label") or "").strip()
+        _radar_scale = str(_messages.get("dashboard_radar_scale_label") or "").strip().format(count=len(radar_items), max=f"{radar_max:g}")
+        radar_svg = f'''<svg viewBox="0 0 440 405" role="img" aria-label="{esc(_radar_aria)}" class="radar-svg">
           {''.join(grids)}{''.join(spokes)}
           <polygon points="{' '.join(data_points)}" fill="rgba(161,0,61,.14)" stroke="#A1003D" stroke-width="2.5"/>
           {''.join(dots)}{''.join(labels)}
-          <text x="220" y="397" text-anchor="middle" font-family="Calibri,Arial,sans-serif" font-size="10" fill="#667985">{len(radar_items)} blocs évalués - échelle 0 à 100 %</text>
+          <text x="220" y="397" text-anchor="middle" font-family="Calibri,Arial,sans-serif" font-size="10" fill="#667985">{esc(_radar_scale)}</text>
         </svg>'''
     else:
-        radar_svg = '<div class="empty-radar">Le radar sera disponible dès qu’au moins trois blocs auront été évalués.</div>'
+        _radar_empty = str(_messages.get("dashboard_radar_empty") or "").strip().format(min_blocks=radar_min_blocks)
+        radar_svg = f'<div class="empty-radar">{esc(_radar_empty)}</div>'
 
     project_rows = [
         ("Projet", meta.get("projet") or "-"), ("Entreprise", meta.get("entreprise") or "-"),
@@ -409,15 +526,23 @@ def build_dashboard(
         ("BIM Manager", meta.get("bim_manager_conv") or "Non détecté"),
         ("Coordinateur BIM", meta.get("coordinateur_bim_conv") or "Non détecté"),
     ]
+    # Les mentions générales de ND/LOD dans une définition ne suffisent pas à
+    # identifier le niveau applicable au projet ou au lot. Tant qu'une règle
+    # d'extraction explicite ne fournit pas une valeur qualifiée, la carte
+    # d'identité reste prudente.
+    nd_display = "Non détecté"
+    platform_value = meta.get("plateforme_conv") or ""
+    platform_page = meta.get("plateforme_page") or ""
+    platform_display = f"{platform_value} — Convention p.{platform_page}" if platform_value and platform_page else (platform_value or "Non précisée")
     technical_rows = [
-        ("Niveau BIM", meta.get("niveau_bim") or "Non précisé"),
-        ("Logiciel", meta.get("logiciel_conv") or "Non précisé"),
-        ("Format IFC", meta.get("format_ifc_conv") or "Non précisé"),
-        ("LOD / ND", meta.get("nd_conv") or meta.get("lod_conv") or "Non précisé"),
-        ("Plateforme CDE", meta.get("plateforme_conv") or "Non précisée"),
-        ("Formats livrables", meta.get("formats_livrables") or "Non précisés"),
-        ("DOE numérique", "Oui" if meta.get("doe_numerique") else "Non précisé"),
-        ("Géoréférencement", "Oui" if meta.get("geo_referencement") else "Non précisé"),
+        ("Niveau BIM", "Non détecté"),
+        ("Logiciel", meta.get("logiciel_conv") or "Non détecté"),
+        ("Format IFC", meta.get("format_ifc_conv") or "Non détecté"),
+        ("Niveau de développement (convention)", nd_display),
+        ("Plateforme CDE", platform_display if platform_value else "Non détecté"),
+        ("Formats livrables", meta.get("formats_livrables") or "Non détecté"),
+        ("DOE numérique", "Oui" if meta.get("doe_numerique") else "Non détecté"),
+        ("Géoréférencement", "Oui" if meta.get("geo_referencement") else "Non détecté"),
     ]
     def identity_rows(rows):
         return "".join(f'<div class="id-row"><span>{esc(label)}</span><strong>{rich(value)}</strong></div>' for label, value in rows)
@@ -437,6 +562,105 @@ def build_dashboard(
     glossary_rows.sort(key=lambda item: item[0].casefold())
     glossary_html = "".join(f'<div class="gloss-row"><strong>{esc(t)}</strong><span>{esc(d)}</span></div>' for t, d in glossary_rows)
 
+    ccap = meta.get("ccap_reperage") or {}
+    ccap_title = (meta.get("messages") or {}).get("ccap_section_title", "")
+    ccap_message = esc(ccap.get("message", ""))
+    ccap_items = ccap.get("items") or []
+    if ccap_items:
+        rows = "".join(
+            f'<tr><td>{esc(item.get("order"))}</td><td>{esc(item.get("text"))}</td><td>{esc(item.get("page"))}</td></tr>'
+            for item in ccap_items
+        )
+        page = ccap.get("page", "")
+        source_button = f'<button type="button" class="source-button" data-pdf="ccap" data-page="{esc(page)}">{esc(ccap.get("source_label", ""))}</button>' if page and ccap_b64 else ""
+        ccap_order_label = esc((meta.get("messages") or {}).get("ccap_col_order_label", ""))
+        ccap_piece_label = esc((meta.get("messages") or {}).get("ccap_col_piece_label", ""))
+        ccap_page_label = esc((meta.get("messages") or {}).get("ccap_col_page_label", ""))
+        ccap_body = f'<p>{ccap_message}</p><div class="gloss-table"><table style="width:100%;border-collapse:collapse"><thead><tr><th style="width:70px">{ccap_order_label}</th><th>{ccap_piece_label}</th><th style="width:70px">{ccap_page_label}</th></tr></thead><tbody>{rows}</tbody></table></div>{source_button}'
+    else:
+        ccap_body = f'<p>{ccap_message}</p>'
+    ccap_panel = f'<details class="support-panel" open><summary>{esc(ccap_title)}</summary><div class="support-body">{ccap_body}</div></details>' if ccap_title and ccap_message else ""
+    vigilances = meta.get("points_vigilance") or []
+    vigilance_title = esc((meta.get("messages") or {}).get("vigilance_section_title") or "Points de vigilance documentaires")
+    if vigilances:
+        vigilance_source_label = esc((meta.get("messages") or {}).get("vigilance_source_label") or "Source")
+        vigilance_excerpt_label = esc((meta.get("messages") or {}).get("vigilance_excerpt_label") or "Extrait")
+        vigilance_occurrences_label = esc((meta.get("messages") or {}).get("vigilance_occurrences_label") or "Citations")
+        other_group = str((meta.get("messages") or {}).get("vigilance_other_group_label") or "Autres vigilances documentaires")
+        grouped_vigilances = {}
+        for v in vigilances:
+            group_label = str(v.get("reference_display_group") or "").strip() if str(v.get("type") or "") == "missing_reference" else ""
+            if not group_label:
+                group_label = other_group
+            try:
+                group_order = int(float(v.get("reference_display_order") or 999))
+            except (TypeError, ValueError):
+                group_order = 999
+            bucket = grouped_vigilances.setdefault(group_label, {"order": group_order, "items": []})
+            bucket["order"] = min(bucket["order"], group_order)
+            bucket["items"].append(v)
+        vigilance_group_parts = []
+        for group_label, group_data in sorted(grouped_vigilances.items(), key=lambda kv: (kv[1]["order"], kv[0].casefold())):
+            vigilance_rows = []
+            for v in group_data["items"]:
+                occurrences = list(v.get("occurrences") or [])
+                if occurrences:
+                    grouped = {}
+                    source_order = []
+                    excerpt_samples = []
+                    for occ in occurrences:
+                        occ_source = str(occ.get("source") or "").strip() or "Document"
+                        occ_page = str(occ.get("page") or "").strip()
+                        occ_excerpt = str(occ.get("excerpt") or "").strip()
+                        if occ_source not in grouped:
+                            grouped[occ_source] = []
+                            source_order.append(occ_source)
+                        if occ_page and occ_page not in grouped[occ_source]:
+                            grouped[occ_source].append(occ_page)
+                        if occ_excerpt and len(excerpt_samples) < 2:
+                            excerpt_samples.append((occ_source, occ_page, occ_excerpt))
+                    location_parts = [src + ((" - p." + ", ".join(grouped[src])) if grouped[src] else "") for src in source_order]
+                    trace_html = f'<div class="vigilance-trace"><b>{vigilance_occurrences_label} :</b> {esc(" ; ".join(location_parts))}</div>'
+                    sample_parts = []
+                    for occ_source, occ_page, occ_excerpt in excerpt_samples:
+                        sample_label = occ_source + (f" - p.{occ_page}" if occ_page else "")
+                        sample_parts.append(f'<div class="vigilance-occurrence"><b>{vigilance_excerpt_label} ({esc(sample_label)}) :</b> {esc(occ_excerpt)}</div>')
+                    excerpt_html = "".join(sample_parts)
+                else:
+                    source = str(v.get("source") or "").strip()
+                    page = str(v.get("page") or "").strip()
+                    excerpt = str(v.get("excerpt") or "").strip()
+                    source_line = source + (f" - p.{page}" if page else "")
+                    trace_html = f'<div class="vigilance-trace"><b>{vigilance_source_label} :</b> {esc(source_line)}</div>' if source_line else ""
+                    excerpt_html = f'<div class="vigilance-excerpt"><b>{vigilance_excerpt_label} :</b> {esc(excerpt)}</div>' if excerpt else ""
+                upload_html = ""
+                if v.get("upload_recommended"):
+                    related = ",".join(str(x) for x in (v.get("related_blocks") or []))
+                    related_label = ", ".join(str(x) for x in (v.get("related_blocks") or []))
+                    button_label = esc((meta.get("messages") or {}).get("vigilance_upload_button") or "Ajouter cette pièce")
+                    related_tpl = str((meta.get("messages") or {}).get("vigilance_upload_related_blocks") or "Bloc(s) concerné(s) : {blocks}")
+                    try:
+                        related_text = esc(related_tpl.format(blocks=related_label))
+                    except Exception:
+                        related_text = esc(related_label)
+                    upload_html = (
+                        f'<div class="vigilance-upload"><small>{related_text}</small>'
+                        f'<button type="button" class="add-missing-doc" data-reference="{esc(v.get("reference") or "")}" '
+                        f'data-source="{esc(v.get("upload_source") or v.get("source") or "")}" data-page="{esc(v.get("upload_page") or v.get("page") or "")}" '
+                        f'data-excerpt="{esc(v.get("upload_excerpt") or v.get("excerpt") or "")}" data-blocks="{esc(related)}">{button_label}</button>'
+                        f'<span class="upload-status" aria-live="polite"></span></div>'
+                    )
+                vigilance_rows.append(
+                    f'<div class="vigilance-item"><b>{esc(v.get("title") or "Point de vigilance")}</b><div>{esc(v.get("text") or "")}</div>{trace_html}{excerpt_html}{upload_html}</div>'
+                )
+            vigilance_group_parts.append(
+                f'<section class="vigilance-family"><div class="vigilance-family-title">{esc(group_label)}</div>{"".join(vigilance_rows)}</section>'
+            )
+        vigilance_items = "".join(vigilance_group_parts)
+        vigilance_panel = f'<details class="support-panel" open><summary>{vigilance_title}</summary><div class="support-body">{vigilance_items}</div></details>'
+    else:
+        vigilance_panel = ""
+
     generated_at = meta.get("generated_at") or datetime.now().strftime("%d/%m/%Y à %H:%M")
     history_html = f'''<div class="history-grid">
       <div><span>Date et heure</span><b>{esc(generated_at)}</b></div>
@@ -451,30 +675,36 @@ def build_dashboard(
 
     css = r'''
 :root{--navy:#071C24;--blue:#1F5D8C;--slate:#49697D;--pale:#EAF3F8;--pale2:#F7FAFC;--magenta:#A1003D;--magenta-light:#F06A9A;--magenta-pale:#F5C8D8;--text:#17232B;--muted:#667985;--line:#C9D6DE;--green:#176B55;--amber:#A66A12;--white:#fff}
-*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:#F2F5F7;color:var(--text);font:14px/1.5 Calibri,Carlito,"Segoe UI",Arial,sans-serif}button,input{font:inherit}h1,h2,h3,.metric b{font-family:"Calibri Light",Calibri,Carlito,"Segoe UI",Arial,sans-serif}.hero{background:var(--navy);border-bottom:6px solid var(--magenta);padding:30px max(26px,calc((100vw - 1540px)/2));display:flex;align-items:center;gap:26px}.logo{font-size:30px;font-weight:800;color:var(--magenta-light);border-right:1px solid rgba(240,106,154,.5);padding-right:24px}.logo img{max-height:44px;max-width:170px;display:block;object-fit:contain}.hero h1{margin:0;color:var(--magenta-light);font-size:38px;line-height:1.04;font-weight:700}.hero p{margin:9px 0 0;color:var(--magenta-pale);font-size:15px;font-weight:600}.hero nav{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}.hero a{color:var(--magenta-pale);border:1px solid rgba(240,106,154,.55);text-decoration:none;padding:9px 12px;font-weight:700;font-size:12px}.hero a.primary{background:var(--magenta);color:#fff}.container{max-width:1540px;margin:auto;padding:22px}.overview-grid{display:grid;grid-template-columns:minmax(650px,1.5fr) minmax(390px,.9fr);gap:18px}.panel,.status-group,.progress-panel,.metrics-panel,.support-panel{background:#fff;border:1px solid var(--line);margin-bottom:18px}.panel>summary,.status-group>summary,.support-panel>summary{list-style:none;cursor:pointer}.panel>summary::-webkit-details-marker,.status-group>summary::-webkit-details-marker,.support-panel>summary::-webkit-details-marker,.req-card>summary::-webkit-details-marker{display:none}.panel-head{padding:12px 15px;background:var(--pale2);display:flex;justify-content:space-between;align-items:center}.panel-head h2{margin:0;font-size:18px;color:var(--navy)}.panel-head span{font-size:11px;color:var(--muted)}.panel-head::after,.status-group>summary::after,.support-panel>summary::after,.req-summary::after{content:"+";color:var(--magenta);font-size:20px;margin-left:12px}.panel[open]>.panel-head::after,.status-group[open]>summary::after,.support-panel[open]>summary::after,.req-card[open]>.req-summary::after{content:"−"}.identity-columns{display:grid;grid-template-columns:1fr 1fr}.identity-column:first-child{border-right:1px solid var(--line)}.column-label{padding:8px 12px;color:var(--magenta);font-size:10px;font-weight:800;text-transform:uppercase;border-bottom:1px solid var(--line)}.id-row{display:grid;grid-template-columns:145px 1fr;gap:10px;padding:7px 12px;border-bottom:1px solid #E7EEF2}.id-row span{color:var(--muted);font-size:11px}.id-row strong{font-size:12px;color:var(--navy);overflow-wrap:anywhere}.docs{padding:12px 14px;border-top:1px solid var(--line)}.docs-title{font-size:10px;text-transform:uppercase;color:var(--magenta);font-weight:800;margin-bottom:8px}.radar-wrap{height:440px;padding:10px}.radar-svg{width:100%;height:100%;display:block}.empty-radar{padding:45px;color:var(--muted)}.progress-panel{padding:14px}.progress-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.progress-card{border-left:4px solid var(--blue);background:var(--pale2);padding:12px}.progress-card b{display:block;color:var(--navy);font-size:24px}.progress-card span{font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:800}.track{height:8px;background:#DDE8EE;margin-top:8px}.track i{display:block;height:100%;background:var(--magenta)}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line)}.metric{background:#fff;padding:15px 18px;border-top:4px solid var(--blue)}.metric.alert{border-color:var(--magenta)}.metric b{display:block;font-size:28px;color:var(--navy)}.metric span{font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:800}.metric small{display:block;margin-top:5px;color:var(--slate)}.requirements-head{display:flex;gap:10px;align-items:center;margin:24px 0 12px}.requirements-head h2{margin:0;color:var(--navy);font-size:22px}.requirements-head input{margin-left:auto;width:320px;border:1px solid var(--line);padding:9px}.status-group>summary{padding:13px 15px;background:var(--pale2);border-left:5px solid var(--magenta);display:flex;align-items:center;gap:10px}.status-group>summary span{display:flex;flex-direction:column}.status-group>summary b{color:var(--navy);font-size:15px}.status-group>summary small{color:var(--muted);font-weight:400}.status-group>summary strong{margin-left:auto;color:var(--slate)}.group-tools{padding:8px 12px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);display:flex;gap:7px}.group-tools button{background:#fff;border:1px solid var(--line);color:var(--navy);padding:6px 9px;cursor:pointer;font-weight:700}.req-card{border-bottom:1px solid var(--line)}.req-summary{list-style:none;cursor:pointer;display:grid;grid-template-columns:70px minmax(230px,1fr) 210px 210px 240px 25px;gap:10px;align-items:center;padding:12px 15px}.req-card[open]>.req-summary{background:var(--pale)}.req-code{color:var(--magenta);font-size:17px;font-weight:800}.req-title{font-weight:700;color:var(--navy)}.status-badge,.capacity-badge{font-size:11px;font-weight:700}.status-badge.confirmed{color:var(--green)}.status-badge.clarify{color:var(--amber)}.status-badge.undemonstrated{color:var(--slate)}.status-badge.excluded{color:var(--muted)}.capacity-badge{color:var(--blue)}.decision-text{font-size:12px;color:var(--slate)}.req-body{padding:0 15px 18px}.req-meta-strip{display:grid;grid-template-columns:repeat(3,1fr);background:var(--pale2);border:1px solid var(--line);margin:0 0 12px}.req-meta-strip div{padding:9px 11px;border-right:1px solid var(--line)}.req-meta-strip div:last-child{border-right:0}.req-meta-strip span{display:block;font-size:9px;text-transform:uppercase;color:var(--muted);font-weight:800}.req-meta-strip b{font-size:12px;color:var(--navy)}.detail-grid{display:grid;grid-template-columns:1fr 1fr;border:1px solid var(--line)}.detail-grid section{padding:14px;border-bottom:1px solid var(--line)}.detail-grid section:nth-child(odd){border-right:1px solid var(--line)}.detail-grid h3,.proofs h3{margin:0 0 7px;color:var(--magenta);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.detail-grid p{margin:0 0 7px}.response-label{display:block;color:var(--blue);font-size:10px;font-weight:800;text-transform:uppercase;margin-bottom:5px}.detail-grid blockquote,.proof-card blockquote{margin:0;border-left:3px solid var(--magenta);padding-left:10px;color:#314A59}.gap-box,.question-box,.warning-box{background:var(--pale2);border-left:3px solid var(--blue);padding:9px;margin-top:9px}.gap-box b,.question-box b,.warning-box b{font-size:10px;text-transform:uppercase;color:var(--magenta)}.action-list{margin:0;padding-left:18px}.action-list li{margin-bottom:10px}.action-list li small{display:block;margin-top:3px;color:var(--muted);font-size:10px;font-style:italic}.proofs{margin-top:12px;border:1px solid var(--line);padding:14px}.proof-card{border-top:1px solid var(--line);padding:12px 0}.proof-card:first-of-type{border-top:0}.proof-meta{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}.proof-meta span,.proof-meta b{font-size:10px;padding:3px 6px;background:var(--pale2);color:var(--slate)}.proof-meta b{color:var(--navy)}.source-button{margin-top:8px;border:1px solid var(--blue);background:#fff;color:var(--blue);padding:6px 9px;cursor:pointer;font-weight:700}.no-proof{background:#FFF4E5;color:#7A4C00;padding:10px;border-left:3px solid var(--amber)}.support-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.support-grid.single{grid-template-columns:1fr}.support-panel>summary{padding:12px 15px;background:var(--pale2);font-weight:800;color:var(--navy);display:flex;align-items:center}.support-body{padding:14px}.history-grid{display:grid;grid-template-columns:repeat(2,1fr);border:1px solid var(--line)}.history-grid div{padding:9px;border-bottom:1px solid var(--line)}.history-grid div:nth-child(odd){border-right:1px solid var(--line)}.history-grid span{display:block;font-size:9px;text-transform:uppercase;color:var(--muted)}.history-grid b{font-size:12px;color:var(--navy)}.gloss-table{border:1px solid var(--line);max-height:520px;overflow:auto}.gloss-row{display:grid;grid-template-columns:115px 1fr;border-bottom:1px solid var(--line)}.gloss-row strong,.gloss-row span{padding:8px}.gloss-row strong{background:var(--pale2);color:var(--blue)}.gloss-row span{font-size:12px;color:var(--slate)}.excluded-note{padding:14px;margin-top:12px}.excluded-note h3{margin:0 0 7px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.excluded-check{background:var(--pale2);border-left:3px solid var(--muted);padding:8px 9px;margin-top:9px;color:var(--slate);font-size:13px}.tip-w{position:relative;display:inline-block;outline:none}.tip{border-bottom:1px dotted var(--magenta);cursor:help}.tip-b{display:none;position:absolute;z-index:30;left:0;bottom:calc(100% + 7px);width:300px;background:var(--navy);color:#fff;padding:10px 11px;font-size:12px;line-height:1.4;box-shadow:0 6px 18px rgba(0,0,0,.22)}.tip-w:hover .tip-b,.tip-w:focus .tip-b{display:block}.tip-src{margin-top:6px;padding-top:5px;border-top:1px solid rgba(255,255,255,.25);font-size:10px;color:var(--magenta-pale)}.modal{display:none;position:fixed;inset:0;background:rgba(7,28,36,.84);z-index:50;padding:24px}.modal.open{display:block}.modal-box{background:#fff;height:100%;display:grid;grid-template-rows:46px 1fr}.modal-head{display:flex;align-items:center;padding:0 13px;border-bottom:1px solid var(--line)}.modal-head button{margin-left:auto;background:var(--magenta);color:#fff;border:0;padding:7px 10px}.modal iframe{width:100%;height:100%;border:0}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:#F2F5F7;color:var(--text);font:14px/1.5 Calibri,Carlito,"Segoe UI",Arial,sans-serif}button,input{font:inherit}h1,h2,h3,.metric b{font-family:"Calibri Light",Calibri,Carlito,"Segoe UI",Arial,sans-serif}.hero{background:var(--navy);border-bottom:6px solid var(--magenta);padding:30px max(26px,calc((100vw - 1540px)/2));display:flex;align-items:center;gap:26px}.logo{font-size:30px;font-weight:800;color:var(--magenta-light);border-right:1px solid rgba(240,106,154,.5);padding-right:24px}.logo img{max-height:44px;max-width:170px;display:block;object-fit:contain}.hero h1{margin:0;color:var(--magenta-light);font-size:38px;line-height:1.04;font-weight:700}.hero p{margin:9px 0 0;color:var(--magenta-pale);font-size:15px;font-weight:600}.hero nav{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}.hero a{color:var(--magenta-pale);border:1px solid rgba(240,106,154,.55);text-decoration:none;padding:9px 12px;font-weight:700;font-size:12px}.hero a.primary{background:var(--magenta);color:#fff}.container{max-width:1540px;margin:auto;padding:22px}.overview-grid{display:grid;grid-template-columns:minmax(650px,1.5fr) minmax(390px,.9fr);gap:18px}.panel,.status-group,.progress-panel,.metrics-panel,.support-panel{background:#fff;border:1px solid var(--line);margin-bottom:18px}.panel>summary,.status-group>summary,.support-panel>summary{list-style:none;cursor:pointer}.panel>summary::-webkit-details-marker,.status-group>summary::-webkit-details-marker,.support-panel>summary::-webkit-details-marker,.req-card>summary::-webkit-details-marker{display:none}.panel-head{padding:12px 15px;background:var(--pale2);display:flex;justify-content:space-between;align-items:center}.panel-head h2{margin:0;font-size:18px;color:var(--navy)}.panel-head span{font-size:11px;color:var(--muted)}.panel-head::after,.status-group>summary::after,.support-panel>summary::after,.req-summary::after{content:"+";color:var(--magenta);font-size:20px;margin-left:12px}.panel[open]>.panel-head::after,.status-group[open]>summary::after,.support-panel[open]>summary::after,.req-card[open]>.req-summary::after{content:"−"}.identity-columns{display:grid;grid-template-columns:1fr 1fr}.identity-column:first-child{border-right:1px solid var(--line)}.column-label{padding:8px 12px;color:var(--magenta);font-size:10px;font-weight:800;text-transform:uppercase;border-bottom:1px solid var(--line)}.id-row{display:grid;grid-template-columns:145px 1fr;gap:10px;padding:7px 12px;border-bottom:1px solid #E7EEF2}.id-row span{color:var(--muted);font-size:11px}.id-row strong{font-size:12px;color:var(--navy);overflow-wrap:anywhere}.docs{padding:12px 14px;border-top:1px solid var(--line)}.docs-title{font-size:10px;text-transform:uppercase;color:var(--magenta);font-weight:800;margin-bottom:8px}.radar-wrap{height:440px;padding:10px}.radar-svg{width:100%;height:100%;display:block}.empty-radar{padding:45px;color:var(--muted)}.progress-panel{padding:14px}.progress-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.progress-card{border-left:4px solid var(--blue);background:var(--pale2);padding:12px}.progress-card b{display:block;color:var(--navy);font-size:24px}.progress-card span{font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:800}.track{height:8px;background:#DDE8EE;margin-top:8px}.track i{display:block;height:100%;background:var(--magenta)}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line)}.metric{background:#fff;padding:15px 18px;border-top:4px solid var(--blue)}.metric.alert{border-color:var(--magenta)}.metric b{display:block;font-size:28px;color:var(--navy)}.metric span{font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:800}.metric small{display:block;margin-top:5px;color:var(--slate)}.requirements-head{display:flex;gap:10px;align-items:center;margin:24px 0 12px}.requirements-head h2{margin:0;color:var(--navy);font-size:22px}.requirements-head input{margin-left:auto;width:320px;border:1px solid var(--line);padding:9px}.status-group>summary{padding:13px 15px;background:var(--pale2);border-left:5px solid var(--magenta);display:flex;align-items:center;gap:10px}.status-group>summary span{display:flex;flex-direction:column}.status-group>summary b{color:var(--navy);font-size:15px}.status-group>summary small{color:var(--muted);font-weight:400}.status-group>summary strong{margin-left:auto;color:var(--slate)}.group-tools{padding:8px 12px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);display:flex;gap:7px}.group-tools button{background:#fff;border:1px solid var(--line);color:var(--navy);padding:6px 9px;cursor:pointer;font-weight:700}.req-card{border-bottom:1px solid var(--line)}.req-summary{list-style:none;cursor:pointer;display:grid;grid-template-columns:70px minmax(230px,1fr) 210px 210px 240px 25px;gap:10px;align-items:center;padding:12px 15px}.req-card[open]>.req-summary{background:var(--pale)}.req-code{color:var(--magenta);font-size:17px;font-weight:800}.req-title{font-weight:700;color:var(--navy)}.status-badge,.capacity-badge{font-size:11px;font-weight:700}.status-badge.confirmed{color:var(--green)}.status-badge.clarify{color:var(--amber)}.status-badge.undemonstrated{color:var(--slate)}.status-badge.excluded{color:var(--muted)}.capacity-badge{color:var(--blue)}.decision-text{font-size:12px;color:var(--slate)}.req-body{padding:0 15px 18px}.req-meta-strip{display:grid;grid-template-columns:repeat(3,1fr);background:var(--pale2);border:1px solid var(--line);margin:0 0 12px}.req-meta-strip div{padding:9px 11px;border-right:1px solid var(--line)}.req-meta-strip div:last-child{border-right:0}.req-meta-strip span{display:block;font-size:9px;text-transform:uppercase;color:var(--muted);font-weight:800}.req-meta-strip b{font-size:12px;color:var(--navy)}.detail-grid{display:grid;grid-template-columns:1fr 1fr;border:1px solid var(--line)}.detail-grid section{padding:14px;border-bottom:1px solid var(--line)}.detail-grid section:nth-child(odd){border-right:1px solid var(--line)}.detail-grid h3,.proofs h3{margin:0 0 7px;color:var(--magenta);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.detail-grid p{margin:0 0 7px}.response-label{display:block;color:var(--blue);font-size:10px;font-weight:800;text-transform:uppercase;margin-bottom:5px}.detail-grid blockquote,.proof-card blockquote{margin:0;border-left:3px solid var(--magenta);padding-left:10px;color:#314A59}.gap-box,.question-box,.warning-box{background:var(--pale2);border-left:3px solid var(--blue);padding:9px;margin-top:9px}.gap-box b,.question-box b,.warning-box b{font-size:10px;text-transform:uppercase;color:var(--magenta)}.capacity-kicker{font-size:9px;text-transform:uppercase;color:var(--muted);font-weight:800}.coverage-box{background:#F4F8FA;border-left:3px solid var(--magenta);padding:8px 9px;margin:8px 0}.coverage-box b{font-size:10px;text-transform:uppercase;color:var(--magenta)}.coverage-box p{margin:3px 0 0!important;color:var(--navy);font-weight:800;font-size:15px}.action-list{margin:0;padding-left:18px}.action-list li{margin-bottom:10px}.action-list li small{display:block;margin-top:3px;color:var(--muted);font-size:10px;font-style:italic}.action-phase{display:inline-block!important;width:max-content;margin:0 0 5px!important;padding:2px 6px;border:1px solid var(--magenta);color:var(--magenta)!important;font-style:normal!important;font-weight:800;text-transform:uppercase;letter-spacing:.03em}.vigilance-item{padding:9px 0;border-bottom:1px solid #E7EEF2}.vigilance-item>b{color:var(--magenta)}.vigilance-item>div{margin-top:4px;color:#314A59}.vigilance-trace,.vigilance-excerpt{font-size:11px;color:var(--slate)!important}.vigilance-excerpt{padding-left:10px;border-left:2px solid var(--line)}.vigilance-occurrence{margin-top:6px;padding:5px 0 5px 10px;border-left:2px solid var(--line);font-size:11px;color:var(--slate)}.vigilance-family{border:1px solid var(--line);margin:0 0 12px;background:#fff}.vigilance-family:last-child{margin-bottom:0}.vigilance-family-title{padding:8px 10px;background:var(--pale2);border-left:4px solid var(--magenta);color:var(--magenta);font-weight:800;text-transform:uppercase;font-size:10.5px;letter-spacing:.03em}.vigilance-family .vigilance-item{padding-left:10px;padding-right:10px}.vigilance-family .vigilance-item:last-child{border-bottom:0}.vigilance-upload{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;padding:8px 10px;background:var(--pale2);border-left:3px solid var(--blue)}.vigilance-upload small{color:var(--slate);font-weight:700}.add-missing-doc{border:1px solid var(--magenta);background:#fff;color:var(--magenta);padding:6px 9px;cursor:pointer;font-weight:800}.add-missing-doc:disabled{opacity:.55;cursor:not-allowed}.upload-status{font-size:11px;color:var(--slate)}.proofs{margin-top:12px;border:1px solid var(--line);padding:14px}.proof-card{border-top:1px solid var(--line);padding:12px 0}.proof-card:first-of-type{border-top:0}.proof-meta{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}.proof-meta span,.proof-meta b{font-size:10px;padding:3px 6px;background:var(--pale2);color:var(--slate)}.proof-meta b{color:var(--navy)}.source-button{margin-top:8px;border:1px solid var(--blue);background:#fff;color:var(--blue);padding:6px 9px;cursor:pointer;font-weight:700}.no-proof{background:#FFF4E5;color:#7A4C00;padding:10px;border-left:3px solid var(--amber)}.support-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.support-grid.single{grid-template-columns:1fr}.support-panel>summary{padding:12px 15px;background:var(--pale2);font-weight:800;color:var(--navy);display:flex;align-items:center}.support-body{padding:14px}.history-grid{display:grid;grid-template-columns:repeat(2,1fr);border:1px solid var(--line)}.history-grid div{padding:9px;border-bottom:1px solid var(--line)}.history-grid div:nth-child(odd){border-right:1px solid var(--line)}.history-grid span{display:block;font-size:9px;text-transform:uppercase;color:var(--muted)}.history-grid b{font-size:12px;color:var(--navy)}.gloss-table{border:1px solid var(--line);max-height:520px;overflow:auto}.gloss-row{display:grid;grid-template-columns:115px 1fr;border-bottom:1px solid var(--line)}.gloss-row strong,.gloss-row span{padding:8px}.gloss-row strong{background:var(--pale2);color:var(--magenta)}.gloss-row span{font-size:12px;color:var(--slate)}.excluded-note{padding:14px;margin-top:12px}.excluded-note h3{margin:0 0 7px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.excluded-check{background:var(--pale2);border-left:3px solid var(--muted);padding:8px 9px;margin-top:9px;color:var(--slate);font-size:13px}.tip-w{position:relative;display:inline-block;outline:none}.tip{border-bottom:1px dotted var(--magenta);cursor:help}.tip-b{display:none;position:absolute;z-index:30;left:0;bottom:calc(100% + 7px);width:300px;background:var(--navy);color:#fff;padding:10px 11px;font-size:12px;line-height:1.4;box-shadow:0 6px 18px rgba(0,0,0,.22)}.tip-w:hover .tip-b,.tip-w:focus .tip-b{display:block}.tip-src{margin-top:6px;padding-top:5px;border-top:1px solid rgba(255,255,255,.25);font-size:10px;color:var(--magenta-pale)}.modal{display:none;position:fixed;inset:0;background:rgba(7,28,36,.84);z-index:50;padding:24px}.modal.open{display:block}.modal-box{background:#fff;height:100%;display:grid;grid-template-rows:46px 1fr}.modal-head{display:flex;align-items:center;padding:0 13px;border-bottom:1px solid var(--line)}.modal-head button{margin-left:auto;background:var(--magenta);color:#fff;border:0;padding:7px 10px}.modal iframe{width:100%;height:100%;border:0}
 @media(max-width:1180px){.overview-grid,.support-grid{grid-template-columns:1fr}.req-summary{grid-template-columns:60px 1fr 190px}.capacity-badge,.decision-text{grid-column:2}.req-summary::after{grid-column:3;grid-row:1/3}.radar-wrap{height:400px}}@media(max-width:780px){.hero{flex-wrap:wrap}.logo{width:100%;border-right:0;border-bottom:1px solid rgba(240,106,154,.45);padding-bottom:10px}.hero h1{font-size:29px}.hero nav{margin-left:0}.identity-columns,.progress-grid,.metrics,.detail-grid,.req-meta-strip{grid-template-columns:1fr}.identity-column:first-child{border-right:0}.detail-grid section:nth-child(odd),.req-meta-strip div{border-right:0}.req-summary{grid-template-columns:55px 1fr}.status-badge,.capacity-badge,.decision-text{grid-column:2}.req-summary::after{grid-column:1;grid-row:2/5}.requirements-head{align-items:stretch;flex-direction:column}.requirements-head input{width:100%;margin-left:0}.history-grid{grid-template-columns:1fr}.history-grid div:nth-child(odd){border-right:0}}
-@media print{.hero nav,.group-tools,.source-button{display:none!important}.status-group,.req-card,.panel,.support-panel{break-inside:avoid}.container{max-width:none;padding:8px}.hero{padding:12px}.hero h1{font-size:24px}.req-summary{grid-template-columns:55px 1fr 170px 170px 200px 20px}.tip-b{display:none!important}}
+@media print{.hero nav,.group-tools,.source-button,.vigilance-upload{display:none!important}.status-group,.req-card,.panel,.support-panel{break-inside:avoid}.container{max-width:none;padding:8px}.hero{padding:12px}.hero h1{font-size:24px}.req-summary{grid-template-columns:55px 1fr 170px 170px 200px 20px}.tip-b{display:none!important}}
 '''
 
     script = f'''
-const PDF_CONV={json.dumps(conv_b64)};const PDF_CCTP={json.dumps(cctp_b64)};let blobUrl=null;
+const PDF_CONV={json.dumps(conv_b64)};const PDF_CCTP={json.dumps(cctp_b64)};const PDF_CCAP={json.dumps(ccap_b64)};const PDF_SUPP={json.dumps(supplement_b64 or {})};let blobUrl=null;
 function b64Blob(b){{const s=atob(b),u=new Uint8Array(s.length);for(let i=0;i<s.length;i++)u[i]=s.charCodeAt(i);return new Blob([u],{{type:'application/pdf'}});}}
-function openPdf(kind,page){{const b=kind==='conv'?PDF_CONV:PDF_CCTP;if(!b)return alert('PDF source non intégré.');if(blobUrl)URL.revokeObjectURL(blobUrl);blobUrl=URL.createObjectURL(b64Blob(b));document.getElementById('pdfFrame').src=blobUrl+'#page='+page;document.getElementById('modal').classList.add('open');}}
+function openPdf(kind,page){{let b=kind==='conv'?PDF_CONV:(kind==='cctp'?PDF_CCTP:(kind==='ccap'?PDF_CCAP:''));if(!b&&PDF_SUPP[kind])b=PDF_SUPP[kind].b64;if(!b)return alert('PDF source non intégré.');if(blobUrl)URL.revokeObjectURL(blobUrl);blobUrl=URL.createObjectURL(b64Blob(b));document.getElementById('pdfFrame').src=blobUrl+'#page='+page;document.getElementById('modal').classList.add('open');}}
 document.querySelectorAll('[data-pdf]').forEach(b=>b.addEventListener('click',()=>openPdf(b.dataset.pdf,Number(b.dataset.page))));
 document.getElementById('closeModal').addEventListener('click',()=>{{document.getElementById('modal').classList.remove('open');document.getElementById('pdfFrame').src='';}});
 document.querySelectorAll('[data-open-group]').forEach(b=>b.addEventListener('click',()=>b.closest('.status-group').querySelectorAll('.req-card').forEach(x=>x.open=true)));
 document.querySelectorAll('[data-close-group]').forEach(b=>b.addEventListener('click',()=>b.closest('.status-group').querySelectorAll('.req-card').forEach(x=>x.open=false)));
 document.getElementById('blockSearch').addEventListener('input',e=>{{const q=e.target.value.toLowerCase();document.querySelectorAll('.req-card').forEach(card=>{{card.hidden=!card.innerText.toLowerCase().includes(q)}});document.querySelectorAll('.status-group').forEach(group=>{{group.hidden=![...group.querySelectorAll('.req-card')].some(card=>!card.hidden)}});}});
+const JOB_MATCH=window.location.pathname.match(/\\/api\\/jobs\\/([a-f0-9]{{32}})\\/result/);const JOB_ID=JOB_MATCH?JOB_MATCH[1]:'';const ACCESS_TOKEN=new URLSearchParams(window.location.search).get('access')||'';
+const MSG_STANDALONE={json.dumps((meta.get('messages') or {}).get('vigilance_upload_standalone') or "L'ajout est disponible lorsque le Dashboard est ouvert depuis l'outil.")};
+const MSG_SENDING={json.dumps((meta.get('messages') or {}).get('vigilance_upload_sending') or "Ajout de la pièce…")};
+const MSG_REANALYSIS={json.dumps((meta.get('messages') or {}).get('vigilance_upload_reanalysis') or "Nouvelle analyse en cours…")};
+async function pollRevision(url,statusEl){{while(true){{const r=await fetch(url,{{cache:'no-store'}});const j=await r.json().catch(()=>({{}}));if(!r.ok)throw new Error(j.error||`Suivi impossible (HTTP ${{r.status}})`);statusEl.textContent=`${{j.stage||'Réanalyse'}} — ${{Math.max(0,Math.min(100,Number(j.progress||0)))}} %`;if(j.status==='completed'){{window.location.href=j.result_url;return;}}if(j.status==='error')throw new Error(j.error||j.detail||'La réanalyse a échoué.');await new Promise(res=>setTimeout(res,700));}}}}
+document.querySelectorAll('.add-missing-doc').forEach(btn=>{{if(!JOB_ID||!ACCESS_TOKEN){{btn.disabled=true;btn.title=MSG_STANDALONE;const st=btn.parentElement.querySelector('.upload-status');if(st)st.textContent=MSG_STANDALONE;return;}}btn.addEventListener('click',()=>{{const input=document.createElement('input');input.type='file';input.accept='application/pdf,.pdf';input.onchange=async()=>{{const file=input.files&&input.files[0];if(!file)return;const st=btn.parentElement.querySelector('.upload-status');btn.disabled=true;if(st)st.textContent=MSG_SENDING;try{{const fd=new FormData();fd.append('document',file,file.name);fd.append('reference',btn.dataset.reference||'');fd.append('source',btn.dataset.source||'');fd.append('page',btn.dataset.page||'');fd.append('excerpt',btn.dataset.excerpt||'');fd.append('blocks',btn.dataset.blocks||'');const r=await fetch(`/api/jobs/${{JOB_ID}}/add-document?access=${{encodeURIComponent(ACCESS_TOKEN)}}`,{{method:'POST',body:fd,cache:'no-store'}});const j=await r.json().catch(()=>({{}}));if(!r.ok){{if(j.result_url)window.location.href=j.result_url;throw new Error(j.error||`Ajout impossible (HTTP ${{r.status}})`);}}if(st)st.textContent=MSG_REANALYSIS;await pollRevision(j.status_url,st);}}catch(err){{btn.disabled=false;if(st)st.textContent=String(err&&err.message||err);}}}};input.click();}});}});
 '''
 
     return f'''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Analyse d'appel d'offres BIM - {esc(meta.get('projet',''))}</title><style>{css}</style></head><body>
 <header class="hero"><div class="logo">{f'<img src="{esc(meta.get("logo_data_uri"))}" alt="Logo">' if meta.get('logo_data_uri') else esc(meta.get('marque') or meta.get('entreprise') or 'Entreprise')}</div><div><h1>ANALYSE D’APPEL D’OFFRES BIM</h1><p>Lecture contractuelle, auto-évaluation des capacités et préparation d’une réponse maîtrisée pour le lot {esc(meta.get('lot',''))}.</p></div><nav><a href="#identity">Identité du projet</a><a class="primary" href="#requirements">Exigences et preuves</a></nav></header>
 <main class="container">
 <section id="identity" class="overview-grid">
-<details class="panel" open><summary class="panel-head"><h2>Carte d’identité du projet</h2><span>Informations détectées et informations saisies</span></summary><div class="identity-columns"><div class="identity-column"><div class="column-label">Dossier et acteurs</div>{identity_rows(project_rows)}</div><div class="identity-column"><div class="column-label">Paramètres BIM utiles</div>{identity_rows(technical_rows)}</div></div><div class="docs"><div class="docs-title">Documents analysés</div>{_render_docs_analyses(meta, tip=tip)}</div></details>
+<details class="panel" open><summary class="panel-head"><h2>Carte d’identité du projet</h2><span>Informations détectées et informations saisies</span></summary><div class="identity-columns"><div class="identity-column"><div class="column-label">Dossier et acteurs</div>{identity_rows(project_rows)}</div><div class="identity-column"><div class="column-label">{esc((meta.get("messages") or {}).get("dashboard_project_params_title") or "Paramètres repérés au niveau du projet")}</div>{identity_rows(technical_rows)}<div style="padding:9px 12px;color:var(--muted);font-size:10.5px;border-top:1px solid var(--line)">{esc((meta.get("messages") or {}).get("dashboard_project_params_note") or "")}</div></div></div><div class="docs"><div class="docs-title">{esc((meta.get("messages") or {}).get("dashboard_documents_title") or "Documents utilisés par l'analyse")}</div>{_render_docs_analyses(meta, tip=tip)}</div></details>
 <details class="panel" open><summary class="panel-head"><h2>Diagramme radar</h2><span>Capacités déclarées, tous blocs évalués</span></summary><div class="radar-wrap">{radar_svg}</div></details>
 </section>
-<section class="metrics-panel"><div class="metrics"><div class="metric"><b>{confirmed}</b><span>Obligations confirmées</span><small>Concernent directement le lot.</small></div><div class="metric alert"><b>{clarify}</b><span>À confirmer</span><small>Périmètre ou contenu à sécuriser.</small></div><div class="metric"><b>{undem}</b><span>Non démontrées</span><small>Aucune preuve ciblée recevable.</small></div><div class="metric"><b>{excluded}</b><span>Exclues / non applicables</span><small>Aucun engagement à prendre.</small></div></div></section>
+<section class="metrics-panel"><div class="metrics">{metrics_html}</div></section>
 <section id="requirements"><div class="requirements-head"><h2>Exigences classées par statut</h2><input id="blockSearch" placeholder="Rechercher un bloc, une preuve ou une action"></div>{''.join(groups_html)}</section>
-<section class="support-grid single"><details class="support-panel"><summary>Glossaire utile</summary><div class="support-body"><div class="gloss-table">{glossary_html}</div><p style="color:var(--muted);font-size:11px">Les preuves et leur qualification sont disponibles directement dans chaque bloc d’exigence.</p></div></details></section>
+<section class="support-grid">{ccap_panel}{vigilance_panel}<details class="support-panel" open><summary>Glossaire utile</summary><div class="support-body"><div class="gloss-table">{glossary_html}</div><p style="color:var(--muted);font-size:11px">Les preuves et leur qualification sont disponibles directement dans chaque bloc d’exigence.</p></div></details></section>
 </main><div class="modal" id="modal"><div class="modal-box"><div class="modal-head"><b>Document source</b><button type="button" id="closeModal">Fermer</button></div><iframe id="pdfFrame"></iframe></div></div><script>{script}</script></body></html>'''

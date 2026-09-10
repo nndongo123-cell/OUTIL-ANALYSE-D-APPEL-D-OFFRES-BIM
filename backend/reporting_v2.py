@@ -57,38 +57,7 @@ GREEN = colors.HexColor(PROFILE["green"])
 GREEN_BG = colors.HexColor(PROFILE["greenbg"])
 WHITE = colors.white
 
-# Filet de sécurité uniquement (voir bim_model._FALLBACK_BLOCK_TITLES) : le
-# titre affiché vient en priorité de la colonne titre_bloc de 10_Blocs.
-_FALLBACK_PLAIN_TITLES = {
-    "B01": "Maquette numérique à produire",
-    "B02": "Données techniques à renseigner",
-    "B03": "Formats de fichiers à remettre",
-    "B04": "Coordination et contrôle des maquettes",
-    "B05": "Positionnement et cohérence géométrique",
-    "B06A": "Dossier numérique de fin de chantier",
-    "B06B": "Données pour l'exploitation et la maintenance",
-    "B07": "Plateforme commune de dépôt",
-    "B08": "Organisation du travail BIM",
-    "B09": "Organisation des échanges entre intervenants",
-    "B10": "Planning lié à la maquette",
-    "B11": "Qualité des objets et modèles numériques",
-    "B12": "Quantités et données de coût",
-}
-
-TECH_REPLACEMENTS = [
-    (r"\blivrables\s+outil\s+de\s+gestion\s+de\s+maintenance\b", "livrables destinés à l'outil de gestion de maintenance"),
-    (r"\bBIM Manager\b(?!\))", "responsable BIM du projet (BIM Manager)"),
-    (r"\bdes\s+données\s+pour\s+la\s+GMAO/AIM\b", "des données pour l'exploitation et la maintenance"),
-    (r"\bla\s+GMAO\b", "l'outil de gestion de maintenance (GMAO)"),
-    (r"\bl['’]AIM\b", "le modèle d'information pour l'exploitation (AIM)"),
-    (r"\bGMAO/AIM\b", "exploitation et maintenance"),
-    (r"\bCDE\b", "plateforme commune de dépôt (CDE)"),
-    (r"\bLOIN\b", "liste des informations à fournir (LOIN)"),
-    (r"\bBIM\s*4D\b", "lien entre la maquette et le planning (BIM 4D)"),
-    (r"\bBIM\s*5D\b", "lien entre la maquette, les quantités et les coûts (BIM 5D)"),
-    (r"\bAIM\b(?!\))", "modèle d'information pour l'exploitation (AIM)"),
-    (r"\bGMAO\b(?!\))", "outil de gestion de maintenance (GMAO)"),
-]
+TECH_REPLACEMENTS = []
 
 
 def _clean(value: Any) -> str:
@@ -266,54 +235,32 @@ ST = _styles()
 
 
 def _status_key(result: Dict[str, Any]) -> str:
-    return _clean(result.get("statut", "")).upper()
+    return _clean(result.get("public_status_key") or result.get("statut", "")).upper()
 
 
 def _status_info(result: Dict[str, Any]) -> Tuple[str, colors.Color, colors.Color]:
-    status = _status_key(result)
-    applicability = _clean(result.get("applicabilite_lot", "")).upper()
-    if status == "CONFIRMÉE" and applicability == "APPLICABLE":
-        return "Confirmée pour le lot", NAVY, SOFT
-    if status in {"PROBABLE", "PARTIELLE"} or applicability in {"PROBABLE", "A_CONFIRMER"}:
-        return "À confirmer pour le lot", AMBER, AMBER_BG
-    if status == "NON DÉMONTRÉE":
-        return "Non démontrée dans les documents", SLATE, SOFT
-    if status == "NON APPLICABLE":
-        return "Non applicable / explicitement exclue", MUTED, SOFT
-    return status.title() or "A examiner", SLATE, SOFT
+    label = _clean(result.get("public_status_label") or result.get("statut"))
+    return label, SLATE, SOFT
 
 
 def _capacity_info(block_id: str, scores: Dict[str, Dict[str, Any]]) -> Tuple[str, Optional[int], colors.Color, colors.Color]:
     score = scores.get(block_id) or {}
     pct = score.get("pct")
-    if not isinstance(pct, int):
-        return "Non évaluée", None, MUTED, SOFT
-    if pct >= 70:
-        return "Démontrée", pct, GREEN, GREEN_BG
-    if pct >= 40:
-        return "Partielle", pct, AMBER, AMBER_BG
-    return "Non démontrée", pct, RED, RED_BG
+    label = _clean(score.get("niveau") or score.get("capacite_label") or score.get("capacite_code"))
+    return label, int(pct) if isinstance(pct, (int, float)) else None, MUTED, SOFT
 
 
 def _priority(result: Dict[str, Any], block_id: str, scores: Dict[str, Dict[str, Any]]) -> Tuple[int, str]:
-    status = _status_key(result)
-    pct = (scores.get(block_id) or {}).get("pct")
-    if status == "CONFIRMÉE" and isinstance(pct, int) and pct < 40:
-        return 0, "Critique - sécuriser avant engagement"
-    if status == "CONFIRMÉE":
-        return 1, "Immédiate"
-    if status in {"PROBABLE", "PARTIELLE"}:
-        return 2, "Avant dépôt"
-    if status == "NON DÉMONTRÉE":
-        return 3, "À surveiller"
-    return 9, "Sans action"
+    try:
+        order = int(result.get("public_priority_order"))
+    except (TypeError, ValueError):
+        order = 9999
+    return order, _clean(result.get("public_priority_short") or result.get("public_priority"))
 
 
 def _plain_title(block_id: str, result: Dict[str, Any]) -> str:
     excel_title = _clean((result.get("bloc") or {}).get("titre_bloc"))
-    if excel_title:
-        return _plain_language(excel_title)
-    return _FALLBACK_PLAIN_TITLES.get(block_id, block_id)
+    return _plain_language(result.get("public_title") or excel_title or block_id)
 
 
 def _original_title(result: Dict[str, Any]) -> str:
@@ -321,83 +268,25 @@ def _original_title(result: Dict[str, Any]) -> str:
 
 
 def _relevant_items(results: Dict[str, Dict[str, Any]], scores: Dict[str, Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
-    items = [(bid, res) for bid, res in results.items() if _status_key(res) != "NON APPLICABLE"]
-    return sorted(items, key=lambda item: (_priority(item[1], item[0], scores)[0], (scores.get(item[0]) or {}).get("pct", 101), item[0]))
+    items = [(bid, res) for bid, res in results.items()]
+    return sorted(items, key=lambda item: (_priority(item[1], item[0], scores)[0], item[0]))
 
 
 def _actions_for(block_id: str, result: Dict[str, Any], scores: Dict[str, Dict[str, Any]]) -> List[str]:
-    block = result.get("bloc") or {}
-    status = _status_key(result)
-    actions: List[str] = []
-    action_text = _clean(block.get("action_confirmee" if status == "CONFIRMÉE" else "action_probable", ""))
-    if action_text:
-        actions.append(_plain_language(action_text))
-    question = _clean(block.get("question_bim_manager", ""))
-    if question:
-        actions.append("Obtenir une réponse écrite du BIM Manager sur le point suivant : " + _plain_language(question))
-    pct = (scores.get(block_id) or {}).get("pct")
-    if isinstance(pct, int):
-        if pct < 40:
-            actions.append("Ne pas prendre un engagement ferme tant que l'écart de capacité n'est pas traité.")
-        elif pct < 70:
-            actions.append("Désigner un responsable et sécuriser le point partiellement maîtrisé avant de confirmer l'engagement.")
-        else:
-            actions.append("Conserver une preuve de la capacité annoncée pour la mise au point du marché.")
-    if not actions:
-        actions.append("Faire valider cette exigence par le référent BIM avant de finaliser l'offre.")
-    # Dedupe while keeping order.
-    seen = set()
-    unique = []
-    for action in actions:
-        key = action.lower()
-        if key not in seen:
-            seen.add(key)
-            unique.append(action)
-    return unique
+    return [_plain_language(action) for action in (result.get("public_actions") or [])]
 
 
 def _proposal_for(block_id: str, proposals: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
     proposal = proposals.get(block_id) or {}
-    text = _clean(proposal.get("texte", ""))
-    if text:
-        label = "Formulation prudente - à confirmer" if proposal.get("conditions_ok") is False else "Proposition à intégrer dans l'offre"
-        return label, _plain_language(text)
-    warning = _clean(proposal.get("avertissement", ""))
-    return "Engagement à ne pas formuler en l'état", _plain_language(warning)
+    return _plain_language(proposal.get("niveau")), _plain_language(proposal.get("texte") or proposal.get("avertissement"))
 
 
 def _situation_summary(block_id: str, scores: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
-    score = scores.get(block_id) or {}
-    responses = score.get("reponses") or []
-    if not responses:
-        return "Capacité non évaluée.", "Réaliser l'auto-évaluation avant tout engagement ferme."
-    strengths = []
-    gaps = []
-    for response in responses:
-        value = response.get("reponse_val")
-        label = _clean(response.get("reponse_label", ""))
-        question = _clean(response.get("question", ""))
-        item = _plain_language(label or question)
-        if value == 2 and item:
-            strengths.append(item)
-        elif value in (0, 1) and item:
-            gaps.append(item)
-    strength = strengths[0] if strengths else "Aucun point fort suffisamment démontré dans les réponses fournies."
-    gap = gaps[0] if gaps else "Aucun écart majeur identifié dans les réponses fournies."
-    return strength, gap
+    return "", ""
 
 
 def _readiness(results: Dict[str, Dict[str, Any]], scores: Dict[str, Dict[str, Any]], contradictions: Sequence[str] | None = None) -> Tuple[str, str, colors.Color, colors.Color]:
-    relevant = _relevant_items(results, scores)
-    if not scores:
-        return "À ÉVALUER AVANT DÉPÔT", "Les exigences ont été analysées, mais la capacité de l'entreprise n'a pas été évaluée.", AMBER, AMBER_BG
-    confirmed_low = [bid for bid, res in relevant if _status_key(res) == "CONFIRMÉE" and (scores.get(bid) or {}).get("pct", 100) < 40]
-    if confirmed_low or contradictions:
-        return "RISQUE IMPORTANT", "Une obligation confirmée n'est pas suffisamment maîtrisée ou une incohérence doit être levée avant engagement.", RED, RED_BG
-    at_risk = [bid for bid, _ in relevant if (scores.get(bid) or {}).get("pct", 100) < 70]
-    if at_risk:
-        return "À SÉCURISER AVANT LE DÉPÔT", "Plusieurs points sont partiellement maîtrisés ou doivent être clarifiés avant de finaliser l'offre.", AMBER, AMBER_BG
-    return "PRÊT À RÉPONDRE", "Les capacités déclarées couvrent les exigences identifiées. Conserver les preuves et confirmer les derniers points contractuels.", GREEN, GREEN_BG
+    return "", "", MUTED, SOFT
 
 
 def _doc_factory(path: Path, title: str):
@@ -565,155 +454,8 @@ def _summary_sentence(confirmed: int, clarify: int, no_eval: bool) -> str:
     return text
 
 
-def generate_action_plan_pdf(
-    out: Path,
-    results: Dict[str, Dict[str, Any]],
-    scores: Dict[str, Dict[str, Any]],
-    proposals: Dict[str, Dict[str, Any]],
-    meta: Dict[str, Any],
-) -> None:
-    out.parent.mkdir(parents=True, exist_ok=True)
-    relevant = _relevant_items(results, scores)
-    doc = _doc_factory(out, "Plan d'actions avant le dépôt de l'offre")
-    story: List[Any] = [
-        _para("PLAN D'ACTIONS AVANT LE DÉPÔT DE L'OFFRE", ST["cover_title"]),
-        _para(f"{meta.get('entreprise', '-')} - Lot {meta.get('lot', '-')}", ST["cover_sub"]),
-        Spacer(1, 5),
-        _para("Ce document ne contient que les actions, les questions à transmettre et les formulations proposées pour l'offre.", ST["body_small"]),
-        HRFlowable(width="100%", thickness=1, color=NAVY, spaceBefore=6, spaceAfter=10),
-    ]
-
-    action_rows: List[List[Any]] = [[
-        _para("FAIT", ST["label"]), _para("PRIORITÉ", ST["label"]),
-        _para("ACTION", ST["label"]), _para("BLOC", ST["label"]),
-        _para("RESPONSABLE", ST["label"]), _para("ÉCHÉANCE", ST["label"]),
-    ]]
-    for bid, result in relevant:
-        _, priority_label = _priority(result, bid, scores)
-        for action in _actions_for(bid, result, scores):
-            action_rows.append([
-                _para("[ ]", ST["table_bold"]), _para(priority_label, ST["table_bold"]),
-                _para(action, ST["table"]), _para(bid, ST["table_bold"]),
-                _para("", ST["table"]), _para("Avant dépôt", ST["table"]),
-            ])
-    action_table = Table(action_rows, colWidths=[10 * mm, 24 * mm, 72 * mm, 13 * mm, 24 * mm, 20 * mm], repeatRows=1)
-    action_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
-        ("TEXTCOLOR", (0, 0), (-1, 0), WHITE),
-        ("BOX", (0, 0), (-1, -1), 0.6, LINE),
-        ("INNERGRID", (0, 0), (-1, -1), 0.35, LINE),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("ALIGN", (0, 1), (0, -1), "CENTER"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 4),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-    ]))
-    story.extend([action_table, PageBreak()])
-    story += _section_title("Questions à transmettre et propositions d'offre")
-
-    for bid, result in relevant:
-        block = result.get("bloc") or {}
-        question = _plain_language(block.get("question_bim_manager", ""))
-        label, proposal = _proposal_for(bid, proposals)
-        status_label, status_fg, status_bg = _status_info(result)
-        cap_label, pct, cap_fg, cap_bg = _capacity_info(bid, scores)
-        header = Table([[
-            _rich_para(f"<b>{_esc(bid)} - {_esc(_plain_title(bid, result))}</b>", ST["h2"]),
-            _badge(status_label, status_fg, status_bg, 47 * mm),
-        ]], colWidths=[114 * mm, 48 * mm])
-        header.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (0, 0), SOFT_2),
-            ("BOX", (0, 0), (-1, -1), 0.6, LINE),
-            ("LINEBEFORE", (0, 0), (0, 0), 2.2, status_fg),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 7),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-            ("TOPPADDING", (0, 0), (-1, -1), 5),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ]))
-        content: List[Any] = [header, Spacer(1, 5), _rich_para(f"<b>Preparation :</b> {_esc(cap_label)}{f' - {pct}%' if pct is not None else ''}", ST["body_small"])]
-        if question:
-            content.extend([_para("Question à transmettre", ST["h3"]), _para(question, ST["body_small"])])
-        if proposal:
-            content.extend([_para(label, ST["h3"]), _para(proposal, ST["quote"])])
-        content.append(Spacer(1, 8))
-        story.append(KeepTogether(content))
-    doc.build(story)
 
 
-def generate_action_plan_html(
-    out: Path,
-    results: Dict[str, Dict[str, Any]],
-    scores: Dict[str, Dict[str, Any]],
-    proposals: Dict[str, Dict[str, Any]],
-    meta: Dict[str, Any],
-) -> None:
-    relevant = _relevant_items(results, scores)
-    storage_key = re.sub(r"[^a-z0-9]+", "-", f"bim-actions-{meta.get('projet','')}-{meta.get('entreprise','')}-{meta.get('lot','')}".lower()).strip("-")
-    cards = []
-    all_proposals = []
-    action_index = 0
-    for bid, result in relevant:
-        status_label, _, _ = _status_info(result)
-        cap_label, pct, _, _ = _capacity_info(bid, scores)
-        actions_html = []
-        for action in _actions_for(bid, result, scores):
-            action_index += 1
-            aid = f"a{action_index}"
-            actions_html.append(
-                f'<label class="action"><input type="checkbox" data-action-id="{aid}"><span>{html.escape(action)}</span></label>'
-            )
-        question = _plain_language((result.get("bloc") or {}).get("question_bim_manager", ""))
-        label, proposal = _proposal_for(bid, proposals)
-        if proposal:
-            all_proposals.append(f"{bid} - {_plain_title(bid, result)}\n{proposal}")
-        cards.append(f"""
-        <article class="card">
-          <header>
-            <div><span class="bid">{html.escape(bid)}</span><h2>{html.escape(_plain_title(bid, result))}</h2></div>
-            <div class="badges"><span>{html.escape(status_label)}</span><span>Preparation : {html.escape(cap_label)}{f' - {pct}%' if pct is not None else ''}</span></div>
-          </header>
-          <section><h3>Actions avant le depot</h3>{''.join(actions_html)}</section>
-          {f'<section><h3>Question a transmettre</h3><p>{html.escape(question)}</p></section>' if question else ''}
-          {f'<section class="proposal"><div class="proposal-head"><h3>{html.escape(label)}</h3><button type="button" class="copy-one">Copier</button></div><blockquote>{html.escape(proposal)}</blockquote></section>' if proposal else ''}
-        </article>
-        """)
-    html_doc = f"""<!doctype html>
-<html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Plan d'actions avant depot</title>
-<style>
-:root{{--navy:{PROFILE["navy"]};--magenta:{PROFILE["red"]};--text:{PROFILE["text"]};--muted:{PROFILE["muted"]};--line:{PROFILE["line"]};--soft:{PROFILE["soft"]};--amber:{PROFILE["amber"]}}}
-*{{box-sizing:border-box}}body{{margin:0;background:#eef1f4;color:var(--text);font:15px/1.55 Calibri,Carlito,"Segoe UI",Arial,sans-serif;border-top:5px solid var(--magenta)}}
-main{{max-width:980px;margin:28px auto;padding:{34 if STYLE_OPTION in ["2","4"] else 28}px {38 if STYLE_OPTION in ["2","4"] else 34}px;background:#fff;box-shadow:0 8px 30px rgba(20,40,60,.08)}}
-.top{{background:{PROFILE["red"] if PROFILE["header_bg"]=="red" else ("#FFFFFF" if PROFILE["header_bg"]=="light" else PROFILE["navy"])};border-bottom:{6 if STYLE_OPTION in ["2","4"] else 4}px solid var(--magenta);padding:{30 if STYLE_OPTION=="4" else (16 if STYLE_OPTION=="3" else 22)}px 24px;display:flex;justify-content:space-between;gap:20px;align-items:flex-start}}
-h1{{font-size:{31 if STYLE_OPTION in ["2","4"] else 28}px;line-height:1.15;color:{PROFILE["navy"] if PROFILE["header_bg"]=="light" else "#fff"};margin:0 0 8px}}.top .bid{{color:{PROFILE["red"] if PROFILE["header_bg"]=="light" else "#f2bfd1"}}}.meta{{color:{PROFILE["slate"] if PROFILE["header_bg"]=="light" else "#dce5e8"}}}
-.toolbar{{display:flex;gap:8px;flex-wrap:wrap;margin:22px 0;padding:12px;background:var(--soft);border:1px solid var(--line);position:sticky;top:0;z-index:5}}
-button{{font:inherit;padding:8px 13px;background:#fff;border:1px solid var(--navy);color:var(--navy);cursor:pointer}}button.primary{{background:var(--magenta);border-color:var(--magenta);color:#fff}}
-.progress{{margin-left:auto;align-self:center;font-weight:700;color:var(--navy)}}
-.card{{border:1px solid var(--line);border-left:5px solid var(--magenta);margin:0 0 16px;background:#fff}}
-.card>header{{display:flex;justify-content:space-between;gap:18px;padding:14px 16px;background:#fafbfc;border-bottom:1px solid var(--line)}}
-.card h2{{font-size:18px;margin:2px 0 0;color:var(--navy)}}.bid{{font-size:11px;color:var(--muted);font-weight:bold}}
-.badges{{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}}.badges span{{border:1px solid var(--line);padding:4px 8px;font-size:12px;background:#fff}}
-section{{padding:12px 16px;border-bottom:1px solid #edf0f2}}section:last-child{{border-bottom:0}}h3{{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}}
-.action{{display:grid;grid-template-columns:24px 1fr;gap:7px;align-items:start;padding:7px 0;border-bottom:1px dotted #dfe3e7}}.action:last-child{{border-bottom:0}}.action input{{width:17px;height:17px;margin-top:3px}}
-.action input:checked+span{{text-decoration:line-through;color:#8b949e}}blockquote{{margin:0;padding:12px 14px;border-left:3px solid var(--magenta);background:var(--soft)}}.proposal-head{{display:flex;justify-content:space-between;align-items:center}}
-@media print{{body{{background:#fff}}main{{box-shadow:none;margin:0;max-width:none;padding:12mm}}.toolbar,button{{display:none!important}}.card{{break-inside:avoid}}}}
-</style></head><body><main>
-<div class="top"><div><div class="bid">PLAN OPERATIONNEL</div><h1>Actions avant le dépôt de l'offre</h1><div class="meta">{html.escape(str(meta.get('entreprise','-')))} - Lot {html.escape(str(meta.get('lot','-')))} - {html.escape(str(meta.get('date','-')))}</div></div></div>
-<div class="toolbar"><button id="copyAll">Copier toutes les propositions</button><button id="reset">Réinitialiser les cases</button><span class="progress" id="progress">0 / {action_index} actions réalisées</span></div>
-{''.join(cards)}
-<script>
-const KEY={json.dumps(storage_key)};const boxes=[...document.querySelectorAll('[data-action-id]')];
-function save(){{const data={{}};boxes.forEach(b=>data[b.dataset.actionId]=b.checked);localStorage.setItem(KEY,JSON.stringify(data));update();}}
-function load(){{try{{const data=JSON.parse(localStorage.getItem(KEY)||'{{}}');boxes.forEach(b=>b.checked=!!data[b.dataset.actionId]);}}catch(e){{}}update();}}
-function update(){{const done=boxes.filter(b=>b.checked).length;document.getElementById('progress').textContent=`${{done}} / ${{boxes.length}} actions réalisées`;}}
-boxes.forEach(b=>b.addEventListener('change',save));
-document.getElementById('reset').onclick=()=>{{if(confirm('Réinitialiser toutes les cases ?')){{boxes.forEach(b=>b.checked=false);save();}}}};
-document.querySelectorAll('.copy-one').forEach(btn=>btn.onclick=async()=>{{const text=btn.closest('.proposal').querySelector('blockquote').innerText;await navigator.clipboard.writeText(text);const old=btn.textContent;btn.textContent='Copie';setTimeout(()=>btn.textContent=old,1200);}});
-document.getElementById('copyAll').onclick=async()=>{{await navigator.clipboard.writeText({json.dumps('\n\n'.join(all_proposals), ensure_ascii=False)});const b=document.getElementById('copyAll');const old=b.textContent;b.textContent='Propositions copiées';setTimeout(()=>b.textContent=old,1200);}};load();
-</script></main></body></html>"""
-    out.write_text(html_doc, encoding="utf-8")
 
 # ============================================================================
 # PROTOTYPE V4 - DOSSIER D'INGENIERIE EXECUTIF
@@ -779,23 +521,14 @@ V4 = _v4_styles()
 
 
 def _v4_status(result: Dict[str, Any]) -> Tuple[str, colors.Color, colors.Color]:
-    key = _status_key(result)
-    if key == 'CONFIRMÉE':
-        return 'Confirmée pour le lot', V4_GREEN, V4_GREEN_BG
-    if key in {'PROBABLE', 'PARTIELLE'}:
-        return 'À confirmer pour le lot', V4_AMBER, V4_AMBER_BG
-    if key == 'NON DÉMONTRÉE':
-        return 'Non démontrée', V4_SLATE, V4_PALE
-    if key == 'NON APPLICABLE':
-        return 'Non applicable / exclue', V4_MUTED, colors.HexColor('#F0F3F5')
-    return key or 'À vérifier', V4_SLATE, V4_PALE
+    return _clean(result.get('public_status_label') or result.get('statut')), V4_SLATE, V4_PALE
 
 
-def _v4_doc(path: Path, title: str, pagesize=A4, landscape_mode: bool = False, marque: str = "Entreprise", logo_bytes: bytes = None):
+def _v4_doc(path: Path, title: str, pagesize=A4, landscape_mode: bool = False, marque: str = "Entreprise", logo_bytes: bytes = None, footer_text: str = "Analyse automatisée - vérification humaine recommandée avant engagement contractuel", top_margin_mm: float = 18):
     page_w, page_h = pagesize
     doc = BaseDocTemplate(
         str(path), pagesize=pagesize,
-        leftMargin=16*mm, rightMargin=16*mm, topMargin=18*mm, bottomMargin=16*mm,
+        leftMargin=16*mm, rightMargin=16*mm, topMargin=top_margin_mm*mm, bottomMargin=16*mm,
         title=title, author=f'{_pdf_safe(marque)} - Outil analyse BIM',
     )
     frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id='v4')
@@ -839,7 +572,7 @@ def _v4_doc(path: Path, title: str, pagesize=A4, landscape_mode: bool = False, m
         canvas.line(document.leftMargin, 10*mm, page_w-document.rightMargin, 10*mm)
         canvas.setFont(FONT, 6.1)
         canvas.setFillColor(V4_MUTED)
-        canvas.drawString(document.leftMargin, 6.6*mm, 'Analyse automatisée - vérification humaine recommandée avant engagement contractuel')
+        canvas.drawString(document.leftMargin, 6.6*mm, _pdf_safe(footer_text))
         canvas.drawRightString(page_w-document.rightMargin, 6.6*mm, f'Page {page}')
         canvas.restoreState()
 
@@ -888,96 +621,11 @@ def _v4_source(result: Dict[str, Any]) -> str:
 
 
 def _v4_decision_text(confirmed: int, clarify: int, excluded: int, scores: Dict[str, Any], contradictions: Sequence[Any]) -> Tuple[str,str]:
-    if contradictions:
-        return ('Décision à suspendre', 'Une contradiction documentaire doit être levée avant tout engagement ferme dans l’offre.')
-    if confirmed and clarify:
-        return ('Réponse possible sous réserves', f'{confirmed} obligation(s) sont confirmée(s) et {clarify} point(s) doivent être sécurisés avant le dépôt.')
-    if confirmed:
-        return ('Réponse possible', f'{confirmed} obligation(s) sont confirmée(s). Les engagements proposés doivent être adaptés aux capacités réelles de l’entreprise.')
-    if clarify:
-        return ('Clarification requise', f'Aucune obligation directe n’est confirmée, mais {clarify} point(s) nécessitent une réponse écrite.')
-    return ('Aucun engagement BIM majeur identifié', 'Les documents analysés ne démontrent pas d’obligation opérationnelle significative pour le lot.')
+    return ('', '')
 
 
-def generate_action_plan_pdf(
-    out: Path,
-    results: Dict[str, Dict[str, Any]],
-    scores: Dict[str, Dict[str, Any]],
-    proposals: Dict[str, Dict[str, Any]],
-    meta: Dict[str, Any],
-) -> None:
-    out.parent.mkdir(parents=True,exist_ok=True)
-    relevant=_relevant_items(results,scores)
-    pagesize=_landscape(A4)
-    doc=_v4_doc(out,"Plan d'actions avant le dépôt de l'offre",pagesize=pagesize,landscape_mode=True)
-    story=[_para("PLAN D'ACTIONS AVANT LE DÉPÔT DE L'OFFRE",V4['cover_title']),_para(f"{meta.get('entreprise','-')} - Lot {meta.get('lot','-')}",V4['cover_sub']),Spacer(1,4),_para("Document opérationnel : actions, responsabilités et échéances. Les questions et formulations sont regroupées dans la seconde partie.",V4['small']),Spacer(1,8)]
-    rows=[[_para('FAIT',V4['label']),_para('PRIORITÉ',V4['label']),_para('ACTION',V4['label']),_para('BLOC',V4['label']),_para('RESPONSABLE',V4['label']),_para('ÉCHÉANCE',V4['label'])]]
-    for bid,r in relevant:
-        _,prio=_priority(r,bid,scores)
-        for a in _actions_for(bid,r,scores):
-            rows.append([_para('□',V4['table_bold']),_para(prio,V4['table_bold']),_para(a,V4['table']),_para(bid,V4['table_bold']),_para('',V4['table']),_para('Avant dépôt',V4['table'])])
-    t=Table(rows,colWidths=[12*mm,25*mm,142*mm,16*mm,42*mm,27*mm],repeatRows=1)
-    styles=[('BACKGROUND',(0,0),(-1,0),V4_NAVY),('TEXTCOLOR',(0,0),(-1,0),V4_WHITE),('BOX',(0,0),(-1,-1),.45,V4_LINE),('INNERGRID',(0,0),(-1,-1),.3,V4_LINE),('VALIGN',(0,0),(-1,-1),'TOP'),('ALIGN',(0,1),(0,-1),'CENTER'),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),5),('BOTTOMPADDING',(0,0),(-1,-1),5)]
-    for i in range(1,len(rows)):
-        if i%2==0: styles.append(('BACKGROUND',(0,i),(-1,i),V4_PALE_2))
-    t.setStyle(TableStyle(styles)); story += [t,PageBreak(),_para("QUESTIONS ET FORMULATIONS POUR L'OFFRE",V4['h1']),Spacer(1,5)]
-    for bid,r in relevant:
-        q=_plain_language((r.get('bloc') or {}).get('question_bim_manager',''))
-        label,prop=_proposal_for(bid,proposals)
-        if not q and not prop: continue
-        left=[_rich_para(f'<b>{_esc(bid)} - {_esc(_plain_title(bid,r))}</b>',V4['h2'])]
-        if q: left += [_para('QUESTION À TRANSMETTRE',V4['h3']),_para(q,V4['small'])]
-        right=[]
-        if prop: right += [_para('FORMULATION POUR L’OFFRE',V4['h3']),_para(prop,V4['small'])]
-        if right:
-            box=Table([[left,right]],colWidths=[129*mm,135*mm])
-            box_style=[('BACKGROUND',(0,0),(0,0),V4_PALE_2),('LINEAFTER',(0,0),(0,0),.35,V4_LINE)]
-        else:
-            box=Table([[left]],colWidths=[264*mm])
-            box_style=[('BACKGROUND',(0,0),(0,0),V4_PALE_2)]
-        box.setStyle(TableStyle(box_style+[('BOX',(0,0),(-1,-1),.45,V4_LINE),('LINEBEFORE',(0,0),(0,0),2,V4_MAGENTA),('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),8),('RIGHTPADDING',(0,0),(-1,-1),8),('TOPPADDING',(0,0),(-1,-1),6),('BOTTOMPADDING',(0,0),(-1,-1),6)]))
-        story += [box,Spacer(1,6)]
-    doc.build(story)
 
 
-def generate_action_plan_html(
-    out: Path,
-    results: Dict[str, Dict[str, Any]],
-    scores: Dict[str, Dict[str, Any]],
-    proposals: Dict[str, Dict[str, Any]],
-    meta: Dict[str, Any],
-) -> None:
-    relevant=_relevant_items(results,scores)
-    storage_key=re.sub(r'[^a-z0-9]+','-',f"bim-actions-v4-{meta.get('projet','')}-{meta.get('entreprise','')}-{meta.get('lot','')}".lower()).strip('-')
-    rows=[]; idx=0; props=[]
-    for bid,r in relevant:
-        sl,_,_=_v4_status(r); _,prio=_priority(r,bid,scores); q=_plain_language((r.get('bloc') or {}).get('question_bim_manager','')); label,prop=_proposal_for(bid,proposals)
-        for a in _actions_for(bid,r,scores):
-            idx+=1; aid=f'a{idx}'
-            rows.append(f'''<article class="action-row" data-status="{html.escape(sl)}" data-block="{html.escape(bid)}">
-              <label class="check"><input type="checkbox" data-action-id="{aid}"><span></span></label>
-              <div class="block"><b>{html.escape(bid)}</b><small>{html.escape(_plain_title(bid,r))}</small></div>
-              <div class="main"><strong>{html.escape(a)}</strong>{f'<details><summary>Question à transmettre</summary><p>{html.escape(q)}</p></details>' if q else ''}{f'<details><summary>Formulation pour l’offre</summary><blockquote>{html.escape(prop)}</blockquote><button class="copy-one" type="button">Copier la formulation</button></details>' if prop else ''}</div>
-              <div class="priority">{html.escape(prio)}</div>
-              <label class="editable"><span>Responsable</span><input data-field="owner" placeholder="À désigner"></label>
-              <label class="editable"><span>Échéance</span><input data-field="date" value="Avant dépôt"></label>
-            </article>''')
-        if prop: props.append(f"{bid} - {_plain_title(bid,r)}\n{prop}")
-    doc=f'''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Plan d'actions BIM</title>
-<style>
-:root{{--navy:#082032;--blue:#1F5D8C;--slate:#49697D;--pale:#EAF3F8;--pale2:#F6F9FB;--magenta:#A1003D;--text:#17232B;--muted:#667985;--line:#C9D6DE;--white:#fff}}
-*{{box-sizing:border-box}}body{{margin:0;background:#f2f5f7;color:var(--text);font:14px/1.45 Calibri,Carlito,"Segoe UI",Arial,sans-serif}}button,input{{font:inherit}}.shell{{min-height:100vh;display:grid;grid-template-columns:245px 1fr}}
-aside{{background:var(--navy);color:#fff;padding:28px 22px;position:sticky;top:0;height:100vh}}.brand{{font-size:26px;font-weight:800;border-bottom:2px solid var(--magenta);padding-bottom:16px;margin-bottom:24px}}aside h1{{font-size:18px;line-height:1.25;margin:0 0 8px}}aside p{{color:#cad6dc;font-size:12px}}.progress{{margin:28px 0}}.progress b{{font-size:30px;display:block}}.bar{{height:5px;background:#38505e;margin-top:8px}}.bar i{{height:100%;display:block;background:var(--magenta);width:0}}.aside-actions button{{display:block;width:100%;margin:8px 0;padding:10px;border:1px solid #8ba0ab;background:transparent;color:#fff;cursor:pointer}}.aside-actions .primary{{background:var(--magenta);border-color:var(--magenta)}}
-main{{padding:28px 34px;max-width:1500px;width:100%}}.top{{display:flex;justify-content:space-between;gap:24px;align-items:end;border-bottom:1px solid var(--line);padding-bottom:16px}}.top h2{{font-size:27px;line-height:1.15;color:var(--navy);margin:0 0 6px}}.meta{{color:var(--muted)}}.summary{{display:grid;grid-template-columns:repeat(3,minmax(160px,1fr));gap:12px;margin:18px 0}}.metric{{background:#fff;border:1px solid var(--line);border-left:4px solid var(--blue);padding:14px}}.metric b{{font-size:24px;color:var(--navy);display:block}}.metric span{{font-size:11px;text-transform:uppercase;color:var(--muted)}}
-.filters{{display:flex;gap:8px;align-items:center;margin:14px 0}}.filters button{{border:1px solid var(--line);background:#fff;padding:8px 12px;color:var(--navy);cursor:pointer}}.filters button.active{{background:var(--navy);color:#fff}}.filters input{{margin-left:auto;width:280px;padding:9px;border:1px solid var(--line)}}
-.list{{display:grid;gap:8px}}.action-row{{display:grid;grid-template-columns:32px 110px minmax(360px,1fr) 105px 145px 130px;gap:12px;align-items:start;background:#fff;border:1px solid var(--line);padding:13px 14px}}.check input{{display:none}}.check span{{display:block;width:19px;height:19px;border:1.5px solid var(--slate);margin-top:3px;cursor:pointer}}.check input:checked+span{{background:var(--magenta);border-color:var(--magenta);box-shadow:inset 0 0 0 4px #fff}}.block b{{display:inline-block;background:var(--navy);color:#fff;padding:4px 7px}}.block small{{display:block;color:var(--muted);margin-top:5px}}.main strong{{font-weight:600}}details{{margin-top:7px;border-top:1px dotted var(--line);padding-top:5px}}summary{{color:var(--blue);cursor:pointer;font-weight:600;font-size:12px}}details p,blockquote{{margin:7px 0;color:#3e505a}}blockquote{{border-left:3px solid var(--magenta);padding-left:10px}}.copy-one{{border:1px solid var(--magenta);background:#fff;color:var(--magenta);padding:5px 8px;cursor:pointer}}.priority{{color:var(--magenta);font-weight:700;font-size:12px;padding-top:4px}}.editable span{{display:block;font-size:10px;text-transform:uppercase;color:var(--muted);margin-bottom:3px}}.editable input{{width:100%;border:0;border-bottom:1px solid var(--line);padding:4px 0;color:var(--text)}}.action-row.done{{opacity:.55}}.action-row.done .main>strong{{text-decoration:line-through}}
-@media(max-width:1100px){{.shell{{grid-template-columns:1fr}}aside{{height:auto;position:static}}.action-row{{grid-template-columns:30px 90px 1fr}}.priority,.editable{{grid-column:auto}}}}@media print{{body{{background:#fff}}aside,.filters,.copy-one{{display:none!important}}.shell{{display:block}}main{{padding:0}}.action-row{{break-inside:avoid;grid-template-columns:25px 90px 1fr 90px 110px 95px}}}}
-h1,h2,h3,.brand,.metric b{{font-family:"Calibri Light",Calibri,Carlito,"Segoe UI",Arial,sans-serif;font-weight:300}}
-</style></head><body><div class="shell"><aside><div class="brand">BNN</div><h1>Plan d'actions avant le dépôt</h1><p>{html.escape(str(meta.get('entreprise','-')))} - Lot {html.escape(str(meta.get('lot','-')))}</p><div class="progress"><b id="progressText">0 / {idx}</b><span>actions réalisées</span><div class="bar"><i id="progressBar"></i></div></div><div class="aside-actions"><button id="copyAll">Copier les formulations</button><button id="reset">Réinitialiser</button></div></aside><main><header class="top"><div><h2>Actions à engager</h2><div class="meta">Responsables et échéances modifiables - mémorisation locale</div></div><div class="meta">Édition {html.escape(str(meta.get('date','-')))}</div></header><section class="summary"><div class="metric"><b>{idx}</b><span>Actions identifiées</span></div><div class="metric"><b>{len(relevant)}</b><span>Blocs concernés</span></div><div class="metric"><b>{sum(1 for _,r in relevant if _status_key(r)=='CONFIRMÉE')}</b><span>Obligations confirmées</span></div></section><div class="filters"><button class="active" data-filter="all">Toutes</button><button data-filter="Immédiate">Prioritaires</button><button data-filter="Avant dépôt">Avant dépôt</button><input id="search" placeholder="Rechercher une action ou un bloc"></div><section class="list">{''.join(rows)}</section></main></div>
-<script>const KEY={json.dumps(storage_key)};const rows=[...document.querySelectorAll('.action-row')];const checks=[...document.querySelectorAll('[data-action-id]')];
-function state(){{try{{return JSON.parse(localStorage.getItem(KEY)||'{{}}')}}catch(e){{return {{}}}}}}function save(){{const d=state();checks.forEach(c=>d[c.dataset.actionId]=c.checked);document.querySelectorAll('[data-field]').forEach((x,i)=>d['f'+i]=x.value);localStorage.setItem(KEY,JSON.stringify(d));update()}}function load(){{const d=state();checks.forEach(c=>c.checked=!!d[c.dataset.actionId]);document.querySelectorAll('[data-field]').forEach((x,i)=>{{if(d['f'+i]!==undefined)x.value=d['f'+i]}});update()}}function update(){{const n=checks.filter(c=>c.checked).length;document.getElementById('progressText').textContent=n+' / '+checks.length;document.getElementById('progressBar').style.width=(checks.length?100*n/checks.length:0)+'%';rows.forEach(r=>r.classList.toggle('done',r.querySelector('[data-action-id]').checked))}}checks.forEach(c=>c.onchange=save);document.querySelectorAll('[data-field]').forEach(x=>x.oninput=save);document.getElementById('reset').onclick=()=>{{if(confirm('Réinitialiser les données ?')){{localStorage.removeItem(KEY);load()}}}};document.getElementById('copyAll').onclick=async()=>{{await navigator.clipboard.writeText({json.dumps(chr(10).join(props),ensure_ascii=False)});}};
-document.querySelectorAll('.copy-one').forEach(b=>b.onclick=async()=>navigator.clipboard.writeText(b.closest('details').querySelector('blockquote').innerText));document.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{{document.querySelectorAll('[data-filter]').forEach(x=>x.classList.remove('active'));b.classList.add('active');const f=b.dataset.filter;rows.forEach(r=>r.hidden=f!=='all'&&!r.querySelector('.priority').innerText.includes(f))}});document.getElementById('search').oninput=e=>{{const q=e.target.value.toLowerCase();rows.forEach(r=>r.hidden=!r.innerText.toLowerCase().includes(q))}};load();</script></body></html>'''
-    out.write_text(doc,encoding='utf-8')
 
 
 # ============================================================================
@@ -1012,8 +660,16 @@ def _v5_action_block_data(
         "title": _plain_title(block_id, result),
         "status": status_label,
         "priority": priority,
+        "priority_code": _clean(result.get("public_priority_code")),
+        "priority_order": result.get("public_priority_order"),
+        "priority_short": _clean(result.get("public_priority_short")) or priority,
+        "priority_note": _clean(result.get("public_priority_note")),
+        "priority_color": _clean(result.get("public_priority_color")),
         "capacity_label": capacity_label,
         "pct": pct,
+        "requirement_coverage_label": _clean(result.get("public_requirement_coverage_label")),
+        "requirement_coverage_pct": result.get("public_requirement_coverage_pct"),
+        "has_requirement_coverage": bool(result.get("public_requirement_question_ids")),
         "strength": strength,
         "gap": gap,
         "demand": demand,
@@ -1024,230 +680,272 @@ def _v5_action_block_data(
     }
 
 
-def generate_action_plan_pdf(
-    out: Path,
-    results: Dict[str, Dict[str, Any]],
-    scores: Dict[str, Dict[str, Any]],
-    proposals: Dict[str, Dict[str, Any]],
-    meta: Dict[str, Any],
-) -> None:
-    out.parent.mkdir(parents=True, exist_ok=True)
-    relevant = _relevant_items(results, scores)
-    blocks = [_v5_action_block_data(bid, result, scores, proposals) for bid, result in relevant]
-    pagesize = _landscape(A4)
-    doc = _v4_doc(out, "Plan d'actions - réponse et mise en conformité", pagesize=pagesize, landscape_mode=True)
-    story: List[Any] = [
-        _para("PLAN D'ACTIONS AVANT LE DÉPÔT DE L'OFFRE", V4["cover_title"]),
-        _para(f"{meta.get('entreprise','-')} - Lot {meta.get('lot','-')}", V4["cover_sub"]),
-        Spacer(1, 4),
-        _para(
-            "Lecture par exigence : demande contractuelle, capacité actuelle, réponse proposée et actions nécessaires pour rendre cette réponse conforme.",
-            V4["small"],
-        ),
-        Spacer(1, 8),
-    ]
-
-    metrics = Table([[
-        _v4_metric(str(len(blocks)), "BLOCS À TRAITER", V4_BLUE),
-        _v4_metric(str(sum(len(b["actions"]) for b in blocks)), "ACTIONS IDENTIFIÉES", V4_MAGENTA),
-        _v4_metric(str(sum(1 for b in blocks if b["pct"] is not None)), "CAPACITÉS ÉVALUÉES", V4_GREEN),
-    ]], colWidths=[88*mm] * 3)
-    metrics.setStyle(TableStyle([
-        ("LEFTPADDING", (0,0), (-1,-1), 2),
-        ("RIGHTPADDING", (0,0), (-1,-1), 2),
-    ]))
-    story += [metrics, Spacer(1, 10)]
-
-    col_widths = [53*mm, 58*mm, 68*mm, 85*mm]
-    header_style = ParagraphStyle(
-        "v5_col_header", parent=V4["label"], textColor=V4_WHITE,
-        fontSize=7.1, leading=8.5, alignment=TA_LEFT,
-    )
-    cell_style = ParagraphStyle(
-        "v5_cell", parent=V4["table"], fontSize=7.1, leading=9.1,
-        textColor=V4_TEXT,
-    )
-    cell_bold = ParagraphStyle(
-        "v5_cell_bold", parent=cell_style, fontName=FONT_BOLD,
-    )
-    note_style = ParagraphStyle(
-        "v5_note", parent=V4["tiny"], fontSize=6.3, leading=7.6,
-        textColor=V4_MUTED,
-    )
-
-    for index, block in enumerate(blocks):
-        prep = f"{block['capacity_label']} - {block['pct']} %" if block["pct"] is not None else block["capacity_label"]
-        block_head = Table([[
-            _rich_para(f"<b>{_esc(block['id'])} - {_esc(block['title'])}</b>", V4["h2"]),
-            _para(block["status"], V4["table_bold"]),
-            _para(block["priority"], V4["table_bold"]),
-            _para(prep, V4["table_bold"]),
-        ]], colWidths=[120*mm, 55*mm, 52*mm, 37*mm])
-        block_head.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (0,0), V4_PALE_2),
-            ("BACKGROUND", (1,0), (-1,0), V4_PALE),
-            ("BOX", (0,0), (-1,-1), .5, V4_LINE),
-            ("LINEBEFORE", (0,0), (0,0), 2.6, V4_MAGENTA),
-            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-            ("LEFTPADDING", (0,0), (-1,-1), 6),
-            ("RIGHTPADDING", (0,0), (-1,-1), 6),
-            ("TOPPADDING", (0,0), (-1,-1), 5),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 5),
-        ]))
-
-        capacity_parts: List[Any] = [
-            _para(prep, cell_bold),
-            Spacer(1, 2),
-            _para(block["strength"], cell_style),
-            Spacer(1, 3),
-            _para("POINT À RENFORCER", note_style),
-            _para(block["gap"], cell_style),
-        ]
-        response_parts: List[Any] = [
-            _para(block["proposal_label"].upper(), note_style),
-            _para(block["proposal"], cell_style),
-        ]
-        action_parts: List[Any] = []
-        for action in block["actions"]:
-            action_parts.append(_rich_para(f"□&nbsp;&nbsp;{_esc(action)}", cell_style))
-            action_parts.append(Spacer(1, 2))
-        if block["question"]:
-            action_parts += [
-                Spacer(1, 2),
-                _para("QUESTION À TRANSMETTRE", note_style),
-                _para(block["question"], cell_style),
-            ]
-        action_parts += [
-            Spacer(1, 4),
-            _para("Responsable : ____________________", note_style),
-            _para("Échéance : avant le dépôt", note_style),
-        ]
-
-        table = Table([
-            [
-                _para("CE QUI EST DEMANDÉ", header_style),
-                _para("CE QUE JE SUIS CAPABLE DE FAIRE EN CE MOMENT", header_style),
-                _para("CE QUE JE DOIS RÉPONDRE", header_style),
-                _para("CE QUE JE DOIS FAIRE POUR ÊTRE CONFORME", header_style),
-            ],
-            [
-                [_para(block["demand"], cell_style)],
-                capacity_parts,
-                response_parts,
-                action_parts,
-            ],
-        ], colWidths=col_widths, repeatRows=1)
-        table.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,0), V4_NAVY),
-            ("TEXTCOLOR", (0,0), (-1,0), V4_WHITE),
-            ("BACKGROUND", (0,1), (-1,1), V4_WHITE),
-            ("BOX", (0,0), (-1,-1), .5, V4_LINE),
-            ("INNERGRID", (0,0), (-1,-1), .35, V4_LINE),
-            ("VALIGN", (0,0), (-1,-1), "TOP"),
-            ("LEFTPADDING", (0,0), (-1,-1), 6),
-            ("RIGHTPADDING", (0,0), (-1,-1), 6),
-            ("TOPPADDING", (0,0), (-1,0), 5),
-            ("BOTTOMPADDING", (0,0), (-1,0), 5),
-            ("TOPPADDING", (0,1), (-1,1), 7),
-            ("BOTTOMPADDING", (0,1), (-1,1), 7),
-        ]))
-        story += [KeepTogether([block_head, table]), Spacer(1, 8)]
-
-    story += [
-        Spacer(1, 2),
-        _para(
-            "Les formulations proposées doivent être relues avant dépôt. Une capacité déclarée ne constitue pas, à elle seule, une preuve contractuelle ou opérationnelle.",
-            V4["small"],
-        ),
-    ]
-    doc.build(story)
 
 
-def generate_action_plan_html(
-    out: Path,
-    results: Dict[str, Dict[str, Any]],
-    scores: Dict[str, Dict[str, Any]],
-    proposals: Dict[str, Dict[str, Any]],
-    meta: Dict[str, Any],
-) -> None:
-    relevant = _relevant_items(results, scores)
-    blocks = [_v5_action_block_data(bid, result, scores, proposals) for bid, result in relevant]
-    glossary = glossary_lookup(meta.get("glossary_entries") or [])
-    aliases = sorted(glossary.keys(), key=len, reverse=True)
-    alias_pattern = re.compile(r"(?<![\w])(" + "|".join(re.escape(a) for a in aliases) + r")(?![\w])", re.IGNORECASE) if aliases else None
-
-    def tip_text(value: Any) -> str:
-        raw = _clean(value)
-        if not raw:
-            return ""
-        escaped = html.escape(raw)
-        if not alias_pattern:
-            return escaped
-        def repl(match):
-            visible = match.group(0)
-            entry = glossary.get(visible.casefold())
-            if not entry:
-                return html.escape(visible)
-            definition = html.escape(str(entry.get("definition", "")))
-            source = html.escape(str(entry.get("source", "")))
-            source_html = f'<small>{source}</small>' if source else ''
-            return f'<span class="term-tip" tabindex="0"><span>{html.escape(visible)}</span><span class="term-bubble">{definition}{source_html}</span></span>'
-        return alias_pattern.sub(repl, escaped)
-
-    storage_key = re.sub(
-        r"[^a-z0-9]+", "-",
-        f"bim-actions-columns-{meta.get('projet','')}-{meta.get('entreprise','')}-{meta.get('lot','')}".lower(),
-    ).strip("-")
-
-    body_rows: List[str] = []
-    all_responses: List[str] = []
-    action_count = 0
-    for block in blocks:
-        prep = f"{block['capacity_label']} - {block['pct']} %" if block["pct"] is not None else block["capacity_label"]
-        action_html = []
-        for action in block["actions"]:
-            action_count += 1
-            action_id = f"action-{action_count}"
-            action_html.append(
-                f'''<label class="task"><input type="checkbox" data-action-id="{action_id}"><span>{html.escape(action)}</span></label>'''
-            )
-        question = (
-            f'''<div class="question"><b>Question à transmettre</b><p>{html.escape(block['question'])}</p></div>'''
-            if block["question"] else ""
-        )
-        body_rows.append(f'''
-        <tbody class="action-block" data-status="{html.escape(block['status'])}" data-priority="{html.escape(block['priority'])}" data-block="{html.escape(block['id'])}">
-          <tr class="block-heading"><th colspan="4"><div><strong>{html.escape(block['id'])} - {html.escape(block['title'])}</strong><span>{html.escape(block['status'])}</span><span>{html.escape(block['priority'])}</span><span>{html.escape(prep)}</span></div></th></tr>
-          <tr class="content-row">
-            <td data-label="Ce qui est demandé"><p>{html.escape(block['demand'])}</p></td>
-            <td data-label="Ce que je suis capable de faire en ce moment"><p class="capacity"><b>{html.escape(prep)}</b></p><p>{html.escape(block['strength'])}</p><div class="gap"><b>Point à renforcer</b><p>{html.escape(block['gap'])}</p></div></td>
-            <td data-label="Ce que je dois répondre"><span class="response-label">{html.escape(block['proposal_label'])}</span><blockquote>{html.escape(block['proposal'])}</blockquote><button class="copy-response" type="button">Copier la réponse</button></td>
-            <td data-label="Ce que je dois faire pour être conforme"><div class="tasks">{''.join(action_html)}</div>{question}<div class="tracking"><label>Responsable<input data-field="owner" placeholder="À désigner"></label><label>Échéance<input data-field="date" value="Avant dépôt"></label></div></td>
-          </tr>
-        </tbody>''')
-        all_responses.append(f"{block['id']} - {block['title']}\n{block['proposal']}")
-
-    confirmed = sum(1 for bid, result in relevant if _status_key(result) == "CONFIRMÉE")
-    doc = f'''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Plan d'actions BIM - {html.escape(str(meta.get('projet','')))}</title>
-<style>
-:root{{--navy:#071C24;--blue:#1F5D8C;--slate:#49697D;--pale:#EAF3F8;--pale2:#F7FAFC;--magenta:#A1003D;--magenta-light:#F06A9A;--text:#17232B;--muted:#667985;--line:#C9D6DE;--green:#176B55;--amber:#A66A12;--white:#fff}}
-*{{box-sizing:border-box}}body{{margin:0;background:#f2f5f7;color:var(--text);font:14px/1.48 Calibri,Carlito,"Segoe UI",Arial,sans-serif}}button,input{{font:inherit}}h1,h2,.metric b{{font-family:"Calibri Light",Calibri,Carlito,"Segoe UI",Arial,sans-serif}}.hero{{background:var(--navy);border-bottom:5px solid var(--magenta);padding:27px max(25px,calc((100vw - 1500px)/2));display:flex;align-items:center;gap:22px}}.brand{{font-size:29px;font-weight:800;color:var(--magenta-light);border-right:1px solid rgba(240,106,154,.45);padding-right:22px}}.hero h1{{margin:0;color:var(--magenta-light);font-size:31px;line-height:1;font-weight:700}}.hero p{{margin:7px 0 0;color:#F5C8D8;font-weight:600}}.hero-actions{{margin-left:auto;display:flex;gap:8px}}.hero-actions button{{border:1px solid rgba(240,106,154,.55);background:transparent;color:#F5C8D8;padding:9px 12px;cursor:pointer;font-weight:700}}.hero-actions .primary{{background:var(--magenta);border-color:var(--magenta);color:#fff}}.container{{max-width:1500px;margin:0 auto;padding:22px}}.summary{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px}}.metric{{background:#fff;border:1px solid var(--line);border-left:4px solid var(--blue);padding:13px 16px}}.metric b{{display:block;font-size:27px;color:var(--navy);font-weight:700}}.metric span{{font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700}}.progress-box{{background:#fff;border:1px solid var(--line);padding:12px 15px;margin-bottom:14px;display:grid;grid-template-columns:180px 1fr;gap:15px;align-items:center}}.progress-box strong{{color:var(--navy)}}.progress{{height:8px;background:#E5EDF1}}.progress i{{display:block;height:100%;background:var(--magenta);width:0;transition:width .25s}}.toolbar{{display:flex;gap:8px;align-items:center;background:#fff;border:1px solid var(--line);padding:10px 12px;margin-bottom:12px;flex-wrap:wrap}}.toolbar button{{border:1px solid var(--line);background:#fff;color:var(--navy);padding:7px 10px;cursor:pointer;font-weight:700}}.toolbar button.active{{background:var(--navy);color:#fff}}.toolbar input{{margin-left:auto;width:280px;padding:8px;border:1px solid var(--line)}}.table-wrap{{overflow-x:auto;background:#fff;border:1px solid var(--line)}}table{{width:100%;border-collapse:collapse;table-layout:fixed}}col.demand{{width:22%}}col.capacity{{width:22%}}col.response{{width:26%}}col.compliance{{width:30%}}thead th{{position:sticky;top:0;z-index:2;background:var(--navy);color:#fff;text-align:left;padding:10px;font-size:11px;text-transform:uppercase;letter-spacing:.04em;border-right:1px solid #39505A}}thead th:last-child{{border-right:0}}.block-heading th{{background:var(--pale2);padding:9px 10px;border-top:3px solid var(--magenta);border-bottom:1px solid var(--line)}}.block-heading div{{display:flex;align-items:center;gap:8px;flex-wrap:wrap}}.block-heading strong{{color:var(--navy);font-size:15px;margin-right:auto}}.block-heading span{{border:1px solid var(--line);background:#fff;color:var(--slate);font-size:11px;padding:3px 7px;font-weight:700}}.content-row td{{vertical-align:top;padding:13px;border-right:1px solid var(--line);border-bottom:1px solid var(--line);overflow-wrap:anywhere}}.content-row td:last-child{{border-right:0}}.content-row p{{margin:0 0 8px}}.capacity b{{color:var(--blue)}}.gap,.question{{background:var(--pale2);border-left:3px solid var(--blue);padding:8px 9px;margin-top:10px}}.gap b,.question b{{font-size:10px;text-transform:uppercase;color:var(--magenta)}}.gap p,.question p{{margin:4px 0 0}}.response-label{{display:block;color:var(--magenta);font-size:10px;text-transform:uppercase;font-weight:700;margin-bottom:5px}}blockquote{{margin:0 0 9px;border-left:3px solid var(--magenta);padding-left:10px;color:#314A59}}.copy-response{{border:1px solid var(--magenta);color:var(--magenta);background:#fff;padding:6px 9px;cursor:pointer;font-weight:700}}.tasks{{display:grid;gap:7px}}.task{{display:grid;grid-template-columns:18px 1fr;gap:7px;align-items:start;cursor:pointer}}.task input{{margin:3px 0 0;accent-color:var(--magenta)}}.task input:checked+span{{text-decoration:line-through;color:var(--muted)}}.tracking{{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px;padding-top:9px;border-top:1px solid var(--line)}}.tracking label{{font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700}}.tracking input{{width:100%;border:0;border-bottom:1px solid var(--line);padding:5px 0;color:var(--text);text-transform:none;font-weight:400}}.action-block.done{{opacity:.62}}
-@media(max-width:950px){{.hero{{flex-wrap:wrap}}.hero-actions{{margin-left:0}}.summary{{grid-template-columns:1fr}}.progress-box{{grid-template-columns:1fr}}.toolbar input{{margin-left:0;width:100%}}.table-wrap{{overflow:visible;border:0;background:transparent}}table,thead,tbody,tr,th,td{{display:block}}thead{{display:none}}.action-block{{display:block;margin-bottom:14px;border:1px solid var(--line);background:#fff}}.block-heading th{{display:block}}.content-row td{{border-right:0;padding:12px}}.content-row td::before{{content:attr(data-label);display:block;font-size:10px;text-transform:uppercase;color:var(--magenta);font-weight:700;margin-bottom:7px}}}}
-@media print{{body{{background:#fff;font-size:10px}}.hero{{background:#fff;border-bottom:2px solid var(--magenta);padding:8px 0}}.brand,.hero h1{{color:var(--navy)}}.hero p{{color:var(--muted)}}.hero-actions,.toolbar,.copy-response{{display:none!important}}.container{{max-width:none;padding:8px 0}}.summary{{grid-template-columns:repeat(3,1fr)}}.table-wrap{{overflow:visible}}thead th{{position:static}}.action-block{{break-inside:avoid}}}}
-</style></head><body>
-<header class="hero"><div class="brand">BNN</div><div><h1>PLAN D'ACTIONS AVANT LE DÉPÔT</h1><p>{html.escape(str(meta.get('entreprise','-')))} - Lot {html.escape(str(meta.get('lot','-')))} - Lecture en quatre colonnes métier</p></div><div class="hero-actions"><button id="copyAll" type="button">Copier toutes les réponses</button><button id="reset" type="button">Réinitialiser</button></div></header>
-<main class="container"><section class="summary"><div class="metric"><b>{len(blocks)}</b><span>Blocs à traiter</span></div><div class="metric"><b>{action_count}</b><span>Actions identifiées</span></div><div class="metric"><b>{confirmed}</b><span>Obligations confirmées</span></div></section><section class="progress-box"><strong id="progressText">0 / {action_count} actions réalisées</strong><div class="progress"><i id="progressBar"></i></div></section><div class="toolbar"><button class="active" data-filter="all" type="button">Tous</button><button data-filter="Immédiate" type="button">Immédiates</button><button data-filter="Avant dépôt" type="button">Avant dépôt</button><button data-filter="À surveiller" type="button">À surveiller</button><input id="search" placeholder="Rechercher un bloc, une demande ou une action"></div><div class="table-wrap"><table><colgroup><col class="demand"><col class="capacity"><col class="response"><col class="compliance"></colgroup><thead><tr><th>Ce qui est demandé</th><th>Ce que je suis capable de faire en ce moment</th><th>Ce que je dois répondre</th><th>Ce que je dois faire pour être conforme</th></tr></thead>{''.join(body_rows)}</table></div></main>
-<script>
-const KEY={json.dumps(storage_key)};const blocks=[...document.querySelectorAll('.action-block')];const checks=[...document.querySelectorAll('[data-action-id]')];const fields=[...document.querySelectorAll('[data-field]')];
-function readState(){{try{{return JSON.parse(localStorage.getItem(KEY)||'{{}}')}}catch(e){{return {{}}}}}}function saveState(){{const state=readState();checks.forEach(c=>state[c.dataset.actionId]=c.checked);fields.forEach((f,i)=>state['field-'+i]=f.value);localStorage.setItem(KEY,JSON.stringify(state));update();}}function loadState(){{const state=readState();checks.forEach(c=>c.checked=!!state[c.dataset.actionId]);fields.forEach((f,i)=>{{if(state['field-'+i]!==undefined)f.value=state['field-'+i]}});update();}}function update(){{const done=checks.filter(c=>c.checked).length;document.getElementById('progressText').textContent=done+' / '+checks.length+' actions réalisées';document.getElementById('progressBar').style.width=(checks.length?100*done/checks.length:0)+'%';blocks.forEach(b=>{{const local=[...b.querySelectorAll('[data-action-id]')];b.classList.toggle('done',local.length>0&&local.every(c=>c.checked));}});}}
-checks.forEach(c=>c.addEventListener('change',saveState));fields.forEach(f=>f.addEventListener('input',saveState));document.getElementById('reset').addEventListener('click',()=>{{if(confirm('Réinitialiser les actions, responsables et échéances ?')){{localStorage.removeItem(KEY);loadState();}}}});document.getElementById('copyAll').addEventListener('click',async()=>{{await navigator.clipboard.writeText({json.dumps(chr(10)+chr(10).join(all_responses), ensure_ascii=False)});}});document.querySelectorAll('.copy-response').forEach(button=>button.addEventListener('click',async()=>{{await navigator.clipboard.writeText(button.closest('td').querySelector('blockquote').innerText);button.textContent='Copié';setTimeout(()=>button.textContent='Copier la réponse',1200);}}));document.querySelectorAll('[data-filter]').forEach(button=>button.addEventListener('click',()=>{{document.querySelectorAll('[data-filter]').forEach(x=>x.classList.remove('active'));button.classList.add('active');const filter=button.dataset.filter;blocks.forEach(block=>block.hidden=filter!=='all'&&!block.dataset.priority.includes(filter));}}));document.getElementById('search').addEventListener('input',event=>{{const query=event.target.value.toLowerCase();blocks.forEach(block=>block.hidden=!block.innerText.toLowerCase().includes(query));}});loadState();
-</script></body></html>'''
-    out.write_text(doc, encoding="utf-8")
 
 # ============================================================================
 # Version V6 - 3 colonnes métier + ligne de conformité pleine largeur
 # Ces définitions finales remplacent la version V5.
 # ============================================================================
+def _priority_groups(blocks: Sequence[Dict[str, Any]], actions_only: bool = False) -> List[Dict[str, Any]]:
+    """Regroupe les blocs/actions à partir de 16_Axes_Config.
+
+    L'ordre, le libellé court, la note et la couleur proviennent du
+    paramétrage Excel. Le code de présentation ne crée aucune catégorie
+    métier et ne choisit aucune couleur de priorité.
+    """
+    grouped: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for block in blocks:
+        try:
+            order = int(block.get("priority_order"))
+        except (TypeError, ValueError):
+            order = 9999
+        short = _clean(block.get("priority_short") or block.get("priority"))
+        note = _clean(block.get("priority_note"))
+        color = _clean(block.get("priority_color"))
+        key = (short, note)
+        entry = grouped.setdefault(key, {"order": order, "short": short, "note": note, "color": color, "blocks": [], "actions": []})
+        entry["order"] = min(entry["order"], order)
+        if not entry.get("color") and color:
+            entry["color"] = color
+        entry["blocks"].append(block)
+        if actions_only:
+            for item in block.get("action_items") or []:
+                text = item.get("text", "") if isinstance(item, dict) else str(item)
+                if text:
+                    entry["actions"].append((block.get("id", ""), text))
+    return sorted(grouped.values(), key=lambda item: (item["order"], item["short"]))
+
+
+def _action_phase_groups(blocks: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Regroupe les actions par moment réel d'exécution.
+
+    La temporalité vient de l'axe ``phase_action`` du classeur, porté par chaque
+    action publique. Elle est volontairement distincte de la priorité du bloc.
+    """
+    grouped: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for block in blocks:
+        for item in block.get("action_items") or []:
+            if not isinstance(item, dict):
+                item = {"text": str(item)}
+            text = _clean(item.get("text"))
+            if not text:
+                continue
+            short = _clean(item.get("phase_short") or item.get("phase_label")) or "Moment à définir"
+            note = _clean(item.get("phase_note"))
+            color = _clean(item.get("phase_color"))
+            try:
+                order = int(item.get("phase_order"))
+            except (TypeError, ValueError):
+                order = 9999
+            key = (short, note)
+            group = grouped.setdefault(key, {"order": order, "short": short, "note": note, "color": color, "actions": []})
+            group["order"] = min(group["order"], order)
+            if not group.get("color") and color:
+                group["color"] = color
+            group["actions"].append((block.get("id", ""), text))
+    return sorted(grouped.values(), key=lambda item: (item["order"], item["short"]))
+
+
+def _priority_presentation_class(short_label: str) -> str:
+    """Classe CSS uniquement graphique ; ne détermine aucune priorité métier."""
+    text = _clean(short_label).casefold()
+    if text.startswith("critique"):
+        return "critique"
+    if text.startswith("haute"):
+        return "haute"
+    if text.startswith("avant dépôt"):
+        return "avant"
+    if text.startswith("à surveiller"):
+        return "surveiller"
+    if text.startswith("à intégrer"):
+        return "offre"
+    return "surveiller"
+
+
+def _ccap_reperage_html_action(meta: Dict[str, Any]) -> str:
+    """Bloc HTML de repérage documentaire, affiché seulement si un CCAP est fourni."""
+    ccap = meta.get("ccap_reperage") or {}
+    if not ccap.get("provided"):
+        return ""
+    messages = meta.get("messages") or {}
+    title = _clean(messages.get("ccap_section_title"))
+    message = _clean(ccap.get("message"))
+    source = _clean(ccap.get("source_label"))
+    items = ccap.get("items") or []
+    item_html = "".join(
+        f'<div class="doc-order-item"><b>{html.escape(str(item.get("order", "")))}</b>'
+        f'<span>{html.escape(str(item.get("text", "")))}</span>'
+        f'<small>{html.escape(str(messages.get("ccap_col_page_label", "")))} {html.escape(str(item.get("page", "")))}</small></div>'
+        for item in items
+    )
+    source_html = f'<div class="doc-order-source">{html.escape(source)}</div>' if source else ""
+    return (
+        f'<details class="checklist document-order" open><summary>{html.escape(title)}</summary>'
+        f'<p class="doc-order-message">{html.escape(message)}</p>'
+        f'{f"<div class=\"doc-order-list\">{item_html}</div>" if item_html else ""}{source_html}</details>'
+    )
+
+
+def _ccap_reperage_html_glossary(meta: Dict[str, Any]) -> str:
+    """Même repérage dans le glossaire, sans modifier sa charte historique."""
+    ccap = meta.get("ccap_reperage") or {}
+    if not ccap.get("provided"):
+        return ""
+    messages = meta.get("messages") or {}
+    title = _clean(messages.get("ccap_section_title"))
+    message = _clean(ccap.get("message"))
+    source = _clean(ccap.get("source_label"))
+    items = ccap.get("items") or []
+    rows = "".join(
+        f'<div class="gloss-row"><strong>{html.escape(str(item.get("order", "")))}</strong>'
+        f'<span>{html.escape(str(item.get("text", "")))}'
+        f'<small>{html.escape(str(messages.get("ccap_col_page_label", "")))} {html.escape(str(item.get("page", "")))}</small></span></div>'
+        for item in items
+    )
+    table = f'<div class="gloss-table" style="margin-bottom:14px">{rows}</div>' if rows else ""
+    source_line = f' — {html.escape(source)}' if source else ""
+    return f'<div class="count-bar"><b>{html.escape(title)}</b><br>{html.escape(message)}{source_line}</div>{table}'
+
+
+def _ccap_reperage_pdf(meta: Dict[str, Any], total_width_mm: float) -> List[Any]:
+    """Flowables de repérage documentaire pour le plan d'actions PDF.
+
+    Présentation compacte : un cartouche de preuve puis une liste tabulaire
+    aérée. Lorsque toutes les pièces proviennent de la même page, la page
+    n'est pas répétée à chaque ligne ; elle reste indiquée dans le cartouche
+    de source.
+    """
+    ccap = meta.get("ccap_reperage") or {}
+    if not ccap.get("provided"):
+        return []
+    messages = meta.get("messages") or {}
+    title = _clean(messages.get("ccap_section_title"))
+    message = _clean(ccap.get("message"))
+    source = _clean(ccap.get("source_label"))
+    items = ccap.get("items") or []
+
+    info_style = ParagraphStyle(
+        "ccap_info", parent=V4["small"], fontSize=8.2, leading=10.6,
+        textColor=V4_NAVY,
+    )
+    source_style = ParagraphStyle(
+        "ccap_source", parent=V4["tiny"], fontName=FONT_BOLD, fontSize=7.2,
+        leading=9.0, textColor=V4_BLUE, alignment=TA_RIGHT,
+    )
+    order_style = ParagraphStyle(
+        "ccap_order", parent=V4["table_bold"], fontSize=8.5, leading=10,
+        textColor=V4_MAGENTA, alignment=TA_CENTER,
+    )
+    piece_style = ParagraphStyle(
+        "ccap_piece", parent=V4["table"], fontSize=7.8, leading=9.8,
+        textColor=V4_TEXT,
+    )
+    page_style = ParagraphStyle(
+        "ccap_page", parent=V4["table_bold"], fontSize=7.4, leading=9,
+        textColor=V4_BLUE, alignment=TA_CENTER,
+    )
+    header_style = ParagraphStyle(
+        "ccap_header", parent=V4["table_bold"], fontSize=7.4, leading=9,
+        textColor=V4_WHITE,
+    )
+
+    total_w = total_width_mm * mm
+    flow: List[Any] = [_para(title.upper(), V4["h2"])]
+
+    # Cartouche d'information et de source, dans la charte historique.
+    info_data = [[_para(message, info_style), _para(source, source_style) if source else ""]]
+    info_tbl = Table(info_data, colWidths=[max(60*mm, total_w - 48*mm), 48*mm])
+    info_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), V4_PALE_2),
+        ("BOX", (0,0), (-1,-1), .45, V4_LINE),
+        ("LINEBEFORE", (0,0), (0,0), 3.0, V4_MAGENTA),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("LEFTPADDING", (0,0), (-1,-1), 8),
+        ("RIGHTPADDING", (0,0), (-1,-1), 8),
+        ("TOPPADDING", (0,0), (-1,-1), 7),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 7),
+    ]))
+    flow.extend([info_tbl, Spacer(1, 7)])
+
+    if items:
+        order_label = _clean(messages.get("ccap_col_order_label"))
+        piece_label = _clean(messages.get("ccap_col_piece_label"))
+        page_label = _clean(messages.get("ccap_col_page_label"))
+        pages = [str(item.get("page", "")).strip() for item in items if str(item.get("page", "")).strip()]
+        unique_pages = list(dict.fromkeys(pages))
+        same_page = len(unique_pages) <= 1
+
+        order_w = 16 * mm
+        page_w = 18 * mm
+        if same_page:
+            piece_w = total_w - order_w
+            data = [[_para(order_label, header_style), _para(piece_label, header_style)]]
+            for item in items:
+                data.append([
+                    _para(item.get("order", ""), order_style),
+                    _para(item.get("text", ""), piece_style),
+                ])
+            col_widths = [order_w, piece_w]
+        else:
+            piece_w = total_w - order_w - page_w
+            data = [[_para(order_label, header_style), _para(piece_label, header_style), _para(page_label, header_style)]]
+            for item in items:
+                data.append([
+                    _para(item.get("order", ""), order_style),
+                    _para(item.get("text", ""), piece_style),
+                    _para(item.get("page", ""), page_style),
+                ])
+            col_widths = [order_w, piece_w, page_w]
+
+        tbl = Table(data, colWidths=col_widths, repeatRows=1, hAlign="LEFT")
+        commands = [
+            ("BACKGROUND", (0,0), (-1,0), V4_NAVY),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ("LEFTPADDING", (0,0), (-1,-1), 7),
+            ("RIGHTPADDING", (0,0), (-1,-1), 7),
+            ("TOPPADDING", (0,0), (-1,0), 6),
+            ("BOTTOMPADDING", (0,0), (-1,0), 6),
+            ("TOPPADDING", (0,1), (-1,-1), 5),
+            ("BOTTOMPADDING", (0,1), (-1,-1), 5),
+            ("BOX", (0,0), (-1,-1), .45, V4_LINE),
+            ("LINEBELOW", (0,1), (-1,-2), .30, V4_LINE),
+            ("BACKGROUND", (0,1), (0,-1), V4_PALE),
+        ]
+        for row in range(1, len(data)):
+            if row % 2 == 0:
+                commands.append(("BACKGROUND", (1,row), (-1,row), V4_PALE_2))
+            else:
+                commands.append(("BACKGROUND", (1,row), (-1,row), V4_WHITE))
+        tbl.setStyle(TableStyle(commands))
+        flow.extend([tbl, Spacer(1, 9)])
+    return flow
+
+
+def _vigilance_pdf(meta: Dict[str, Any], width_mm: float) -> List[Any]:
+    items = meta.get("points_vigilance") or []
+    if not items:
+        return []
+    messages = meta.get("messages") or {}
+    title = _clean(messages.get("vigilance_section_title")) or "Points de vigilance documentaires"
+    out: List[Any] = [_para(title.upper(), V4["h2"]), Spacer(1, 4)]
+    rows = []
+    for item in items:
+        rows.append([
+            _rich_para(_esc(item.get("title") or "Point de vigilance"), V4["table_bold"]),
+            _rich_para(_esc(item.get("text") or ""), V4["small"]),
+        ])
+    t = Table(rows, colWidths=[48*mm, max(40*mm, width_mm*mm-48*mm)])
+    t.setStyle(TableStyle([
+        ("VALIGN",(0,0),(-1,-1),"TOP"), ("GRID",(0,0),(-1,-1),0.25,V4_LINE),
+        ("BACKGROUND",(0,0),(0,-1),V4_PALE), ("LEFTPADDING",(0,0),(-1,-1),5),
+        ("RIGHTPADDING",(0,0),(-1,-1),5), ("TOPPADDING",(0,0),(-1,-1),5),
+        ("BOTTOMPADDING",(0,0),(-1,-1),5),
+    ]))
+    out += [t, Spacer(1, 8)]
+    return out
+
+
 def generate_action_plan_pdf(
     out: Path,
     results: Dict[str, Dict[str, Any]],
@@ -1259,62 +957,97 @@ def generate_action_plan_pdf(
     out.parent.mkdir(parents=True, exist_ok=True)
     relevant = _relevant_items(results, scores)
     blocks = [_v5_action_block_data(bid, result, scores, proposals) for bid, result in relevant]
+    _messages = meta.get("messages") or {}
+    no_action_required = _clean(_messages.get("ui_no_action_required"))
+    global_capacity_title = _clean(_messages.get("ui_capacity_global_label")) or "Capacité générale"
+    requirement_coverage_title = _clean(_messages.get("ui_requirement_coverage_label")) or "Couverture de l'exigence"
+    evidence_title = _clean(_messages.get("ui_evidence_retained_label")) or "Preuves retenues"
     pagesize = _landscape(A4)
     doc = _v4_doc(out, "Plan d'actions - réponse et mise en conformité", pagesize=pagesize, landscape_mode=True, marque=meta.get("marque") or meta.get("entreprise") or "Entreprise", logo_bytes=meta.get("logo_bytes"))
+    _identity_items_pdf = [item for item in [
+        ("Projet", meta.get("nom_projet")),
+        ("Entreprise", meta.get("entreprise")),
+        ("Lot", meta.get("lot")),
+        ("Documents analysés", meta.get("documents_analyses") or meta.get("documents_resume")),
+        ("Adresse", meta.get("adresse")),
+        ("Email", meta.get("email")),
+        ("Analyse réalisée par", meta.get("analyste")),
+        ("Date", meta.get("date")),
+    ] if item[1]]
+    _id_label_style = ParagraphStyle("id_label", parent=V4["small"], fontName=FONT_BOLD, textColor=colors.HexColor("#8FA3AC"), fontSize=7, leading=11)
+    _id_value_style = ParagraphStyle("id_value", parent=V4["small"], textColor=V4_NAVY, fontSize=8.3, leading=11)
     story: List[Any] = [
-        _para("PLAN D'ACTIONS AVANT LE DÉPÔT DE L'OFFRE", V4["cover_title"]),
-        _para(f"{meta.get('entreprise','-')} - Lot {meta.get('lot','-')}", V4["cover_sub"]),
-        Spacer(1, 4),
+        _para(_clean(_messages.get("ui_action_plan_title")) or "PLAN D'ACTIONS — DE L'OFFRE À L'EXÉCUTION", V4["cover_title"]),
+        _para(_clean(_messages.get("ui_action_plan_subtitle")) or "Demande, capacité et réponse par exigence, avec temporalité des actions", V4["cover_sub"]),
+        Spacer(1, 6),
+    ]
+    if _identity_items_pdf:
+        id_table = Table(
+            [[_rich_para(_esc(label.upper()), _id_label_style), _rich_para(_esc(str(value)), _id_value_style)] for label, value in _identity_items_pdf],
+            colWidths=[42*mm, 130*mm],
+        )
+        id_table.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 1.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ]))
+        id_table.hAlign = "LEFT"
+        story.append(id_table)
+    story += [
+        Spacer(1, 10),
         _para(
-            "Pour chaque exigence : demande contractuelle, capacité actuelle et réponse proposée. "
+            "Pour chaque exigence : demande contractuelle, capacité générale de l'entreprise, couverture ciblée de l'exigence et réponse proposée. "
             "Les actions de mise en conformité sont regroupées juste en dessous sur toute la largeur.",
             V4["small"],
         ),
         Spacer(1, 8),
     ]
 
+    metric_blocks_label = _clean(_messages.get("ui_metric_blocks_label"))
+    metric_actions_label = _clean(_messages.get("ui_metric_actions_label"))
+    metric_confirmed_label = _clean(_messages.get("ui_metric_confirmed_label"))
+    confirmed_count = sum(
+        1 for _bid, _result in relevant
+        if _clean(_result.get("public_status_key")).upper() == "CONFIRMED"
+    )
     metrics = Table([[
-        _v4_metric(str(len(blocks)), "BLOCS À TRAITER", V4_BLUE),
-        _v4_metric(str(sum(len(b["actions"]) for b in blocks)), "ACTIONS IDENTIFIÉES", V4_MAGENTA),
-        _v4_metric(str(sum(1 for b in blocks if b["pct"] is not None)), "CAPACITÉS ÉVALUÉES", V4_GREEN),
+        _v4_metric(str(len(blocks)), metric_blocks_label.upper(), V4_BLUE),
+        _v4_metric(str(sum(len(b["actions"]) for b in blocks)), metric_actions_label.upper(), V4_MAGENTA),
+        _v4_metric(str(confirmed_count), metric_confirmed_label.upper(), V4_GREEN),
     ]], colWidths=[88*mm] * 3)
     metrics.setStyle(TableStyle([
         ("LEFTPADDING", (0,0), (-1,-1), 2),
         ("RIGHTPADDING", (0,0), (-1,-1), 2),
     ]))
     story += [metrics, Spacer(1, 10)]
+    story += _ccap_reperage_pdf(meta, 264)
+    story += _vigilance_pdf(meta, 264)
 
-    # Checklist récapitulative par niveau de priorité (même logique que la
-    # version HTML) : aucun niveau n'empêche à proprement parler le dépôt de
-    # l'offre, ce sont des degrés d'importance à traiter.
-    _ORDRE_PRIORITE = ["Critique", "Haute", "Avant dépôt", "À surveiller"]
-    _NOTE_PRIORITE = {
-        "Critique": "à traiter avant de finaliser l'offre",
-        "Haute": "à consolider en interne, ne bloque pas le dépôt",
-        "Avant dépôt": "réserve ou question à formuler dans l'offre",
-        "À surveiller": "sans urgence immédiate",
-    }
-    _groupes_pdf: Dict[str, List[str]] = {p: [] for p in _ORDRE_PRIORITE}
-    for block in blocks:
-        prio = next((p for p in _ORDRE_PRIORITE if block["priority"].startswith(p)), "À surveiller")
-        for item in block.get("action_items") or []:
-            texte = item.get("text", "") if isinstance(item, dict) else str(item)
-            if texte:
-                _groupes_pdf[prio].append(f"{block['id']} — {texte}")
-    _checklist_title_style = ParagraphStyle(
-        "checklist_group_title", parent=V4["h2"], fontSize=9.5, leading=11.5, textColor=V4_MAGENTA,
-    )
+    # Checklist récapitulative regroupée par temporalité réelle des actions.
+    # La phase vient de l'axe phase_action de 16_Axes_Config et reste distincte
+    # de la priorité de l'exigence.
+    _groupes_pdf = _action_phase_groups(blocks)
     _checklist_item_style = ParagraphStyle(
         "checklist_item", parent=V4["table"], fontSize=7.6, leading=9.6,
     )
-    if any(_groupes_pdf.values()):
-        story.append(_para("CHECKLIST DES ACTIONS PAR NIVEAU DE PRIORITÉ", V4["h2"]))
+    if any(group["actions"] for group in _groupes_pdf):
+        story.append(_para("CHECKLIST DES ACTIONS À MENER", V4["h2"]))
         story.append(Spacer(1, 3))
-        for prio in _ORDRE_PRIORITE:
-            if not _groupes_pdf[prio]:
+        for group in _groupes_pdf:
+            if not group["actions"]:
                 continue
-            story.append(_para(f"{prio} — {_NOTE_PRIORITE[prio]}", _checklist_title_style))
-            for line in _groupes_pdf[prio]:
+            heading = group["short"] + (f" — {group['note']}" if group["note"] else "")
+            try:
+                heading_color = colors.HexColor(group.get("color") or "#A1003D")
+            except Exception:
+                heading_color = V4_MAGENTA
+            checklist_group_style = ParagraphStyle(
+                f"checklist_group_{group['order']}_{len(group['actions'])}", parent=V4["h2"],
+                fontSize=9.5, leading=11.5, textColor=heading_color,
+            )
+            story.append(_para(heading, checklist_group_style))
+            for bid, text in group["actions"]:
+                line = f"{bid} — {text}"
                 story.append(_rich_para(f"□&nbsp;&nbsp;{_esc(line)}", _checklist_item_style))
             story.append(Spacer(1, 4))
         story.append(Spacer(1, 8))
@@ -1354,12 +1087,26 @@ def generate_action_plan_pdf(
             _para("PRIORITÉ", note_style),
             _para(block["priority"], cell_bold),
             Spacer(1, 6),
-            _para("CAPACITÉ ACTUELLE", note_style),
+            _para(global_capacity_title.upper(), note_style),
             _para(prep, cell_bold),
         ]
+        if block.get("has_requirement_coverage"):
+            meta_parts += [
+                Spacer(1, 6),
+                _para(requirement_coverage_title.upper(), note_style),
+                _para(block.get("requirement_coverage_label") or "", cell_bold),
+            ]
 
         capacity_parts: List[Any] = [
-            _para(prep, cell_bold), Spacer(1, 2),
+            _para(global_capacity_title.upper(), note_style),
+            _para(prep, cell_bold), Spacer(1, 3),
+        ]
+        if block.get("has_requirement_coverage"):
+            capacity_parts += [
+                _para(requirement_coverage_title.upper(), note_style),
+                _para(block.get("requirement_coverage_label") or "", cell_bold), Spacer(1, 4),
+            ]
+        capacity_parts += [
             _para(block["strength"], cell_style), Spacer(1, 3),
             _para("POINT À RENFORCER", note_style),
             _para(block["gap"], cell_style),
@@ -1369,12 +1116,33 @@ def generate_action_plan_pdf(
             _para(block["proposal"], cell_style),
         ]
 
+        evidence_parts: List[Any] = []
+        if block.get("evidence"):
+            evidence_parts.append(_para(evidence_title.upper(), compliance_title))
+            evidence_parts.append(Spacer(1, 3))
+            for ev in block.get("evidence") or []:
+                source = _clean(ev.get("source"))
+                page = _clean(ev.get("page"))
+                excerpt = _clean(ev.get("text"))
+                source_line = source + (f" - p.{page}" if page else "")
+                evidence_parts.append(_para(source_line, cell_bold))
+                if excerpt:
+                    evidence_parts.append(_para(excerpt, cell_style))
+                evidence_parts.append(Spacer(1, 3))
+
         compliance_parts: List[Any] = [
             _para("CE QUE JE DOIS FAIRE POUR ÊTRE CONFORME", compliance_title),
             Spacer(1, 4),
         ]
-        for action in block["actions"]:
-            compliance_parts.append(_rich_para(f"□&nbsp;&nbsp;{_esc(action)}", cell_style))
+        for item in block.get("action_items") or []:
+            if isinstance(item, dict):
+                action = _clean(item.get("text"))
+                phase = _clean(item.get("phase_short") or item.get("phase_label"))
+            else:
+                action = _clean(item)
+                phase = ""
+            prefix = f"<b>{_esc(phase)}</b> — " if phase else ""
+            compliance_parts.append(_rich_para(f"□&nbsp;&nbsp;{prefix}{_esc(action)}", cell_style))
             compliance_parts.append(Spacer(1, 2))
         if block["question"]:
             compliance_parts += [
@@ -1383,19 +1151,31 @@ def generate_action_plan_pdf(
                 _para(block["question"], cell_style),
             ]
         if block["actions"] or block["question"]:
+            phase_labels = []
+            for item in block.get("action_items") or []:
+                if isinstance(item, dict):
+                    label = _clean(item.get("phase_short") or item.get("phase_label"))
+                    if label and label not in phase_labels:
+                        phase_labels.append(label)
+            if len(phase_labels) == 1:
+                due_text = phase_labels[0]
+            elif len(phase_labels) > 1:
+                due_text = _clean(_messages.get("ui_due_multiple_phases")) or "Selon les phases indiquées ci-dessus"
+            else:
+                due_text = _clean(_messages.get("ui_due_no_phase")) or _clean(_messages.get("ui_due_default")) or "À définir selon le jalon contractuel"
             compliance_parts += [
                 Spacer(1, 5),
                 HRFlowable(width="100%", thickness=.35, color=V4_LINE, spaceBefore=0, spaceAfter=5),
                 _para("Responsable : ______________________________", note_style),
                 Spacer(1, 3),
-                _para("Échéance : avant le dépôt", note_style),
+                _para(f"Échéance : {due_text}", note_style),
             ]
         else:
             compliance_parts.append(
-                _para("Aucune action supplémentaire : exigence déjà confirmée et capacité démontrée.", cell_style)
+                _para(block.get("no_action_note") or no_action_required, cell_style)
             )
 
-        table = Table([
+        table_rows = [
             [
                 meta_parts,
                 _para("CE QUI EST DEMANDÉ", header_style),
@@ -1408,21 +1188,27 @@ def generate_action_plan_pdf(
                 capacity_parts,
                 response_parts,
             ],
-            ["", compliance_parts, "", ""],
-        ], colWidths=col_widths)
-        table.setStyle(TableStyle([
-            ("SPAN", (0,0), (0,2)),
-            ("SPAN", (1,2), (3,2)),
-            ("BACKGROUND", (0,0), (0,2), V4_PALE),
+        ]
+        evidence_row_index = None
+        if evidence_parts:
+            evidence_row_index = len(table_rows)
+            table_rows.append(["", evidence_parts, "", ""])
+        compliance_row_index = len(table_rows)
+        table_rows.append(["", compliance_parts, "", ""])
+        table = Table(table_rows, colWidths=col_widths)
+        table_style = [
+            ("SPAN", (0,0), (0,compliance_row_index)),
+            ("SPAN", (1,compliance_row_index), (3,compliance_row_index)),
+            ("BACKGROUND", (0,0), (0,compliance_row_index), V4_PALE),
             ("BACKGROUND", (1,0), (3,0), V4_NAVY),
             ("TEXTCOLOR", (1,0), (3,0), V4_WHITE),
             ("BACKGROUND", (1,1), (3,1), V4_WHITE),
-            ("BACKGROUND", (1,2), (3,2), V4_PALE_2),
+            ("BACKGROUND", (1,compliance_row_index), (3,compliance_row_index), V4_PALE_2),
             ("BOX", (0,0), (-1,-1), .5, V4_LINE),
-            ("LINEBEFORE", (0,0), (0,2), 2.8, V4_MAGENTA),
+            ("LINEBEFORE", (0,0), (0,compliance_row_index), 2.8, V4_MAGENTA),
             ("INNERGRID", (1,0), (3,1), .35, V4_LINE),
-            ("LINEAFTER", (0,0), (0,2), .7, V4_BLUE),
-            ("LINEABOVE", (1,2), (3,2), 1.1, V4_BLUE),
+            ("LINEAFTER", (0,0), (0,compliance_row_index), .7, V4_BLUE),
+            ("LINEABOVE", (1,compliance_row_index), (3,compliance_row_index), 1.1, V4_BLUE),
             ("VALIGN", (0,0), (-1,-1), "TOP"),
             ("LEFTPADDING", (0,0), (-1,-1), 7),
             ("RIGHTPADDING", (0,0), (-1,-1), 7),
@@ -1430,9 +1216,18 @@ def generate_action_plan_pdf(
             ("BOTTOMPADDING", (0,0), (-1,0), 6),
             ("TOPPADDING", (0,1), (-1,1), 7),
             ("BOTTOMPADDING", (0,1), (-1,1), 7),
-            ("TOPPADDING", (0,2), (-1,2), 7),
-            ("BOTTOMPADDING", (0,2), (-1,2), 7),
-        ]))
+            ("TOPPADDING", (0,compliance_row_index), (-1,compliance_row_index), 7),
+            ("BOTTOMPADDING", (0,compliance_row_index), (-1,compliance_row_index), 7),
+        ]
+        if evidence_row_index is not None:
+            table_style += [
+                ("SPAN", (1,evidence_row_index), (3,evidence_row_index)),
+                ("BACKGROUND", (1,evidence_row_index), (3,evidence_row_index), colors.HexColor("#F8FAFB")),
+                ("LINEABOVE", (1,evidence_row_index), (3,evidence_row_index), .5, V4_LINE),
+                ("TOPPADDING", (1,evidence_row_index), (3,evidence_row_index), 6),
+                ("BOTTOMPADDING", (1,evidence_row_index), (3,evidence_row_index), 6),
+            ]
+        table.setStyle(TableStyle(table_style))
         story += [KeepTogether([table]), Spacer(1, 8)]
 
     story += [
@@ -1456,6 +1251,15 @@ def generate_action_plan_html(
     """Plan HTML : identité du bloc à gauche, 3 colonnes métier et conformité pleine largeur."""
     relevant = _relevant_items(results, scores)
     blocks = [_v5_action_block_data(bid, result, scores, proposals) for bid, result in relevant]
+    _messages = meta.get("messages") or {}
+    due_default = _clean(_messages.get("ui_due_default"))
+    no_action_required = _clean(_messages.get("ui_no_action_required"))
+    global_capacity_title = _clean(_messages.get("ui_capacity_global_label")) or "Capacité générale"
+    requirement_coverage_title = _clean(_messages.get("ui_requirement_coverage_label")) or "Couverture de l'exigence"
+    evidence_title = _clean(_messages.get("ui_evidence_retained_label")) or "Preuves retenues"
+    metric_blocks_label = _clean(_messages.get("ui_metric_blocks_label"))
+    metric_actions_label = _clean(_messages.get("ui_metric_actions_label"))
+    metric_confirmed_label = _clean(_messages.get("ui_metric_confirmed_label"))
     glossary = glossary_lookup(meta.get("glossary_entries") or [])
     aliases = sorted(glossary.keys(), key=len, reverse=True)
     alias_pattern = re.compile(
@@ -1499,22 +1303,38 @@ def generate_action_plan_html(
 
     body_rows: List[str] = []
     all_responses: List[str] = []
-    _all_actions: List[Tuple[str, str, str, str]] = []  # (action_id, block_id, priority, text)
+    _all_actions: List[Tuple[str, str, str, str, str, int, str]] = []  # id, bloc, phase, note, couleur, ordre, texte
     action_count = 0
     for block in blocks:
         prep = f"{block['capacity_label']} - {block['pct']} %" if block["pct"] is not None else block["capacity_label"]
+        coverage_html = (
+            f'<div class="coverage"><b>{html.escape(requirement_coverage_title)}</b><p>{html.escape(block.get("requirement_coverage_label") or "")}</p></div>'
+            if block.get("has_requirement_coverage") else ""
+        )
         action_html: List[str] = []
+        block_phase_labels: List[str] = []
         for item in block.get("action_items") or []:
             action_count += 1
             action_id = f"action-{action_count}"
             action = item.get("text", "") if isinstance(item, dict) else str(item)
             origin = item.get("origin", "") if isinstance(item, dict) else ""
+            phase_short = _clean(item.get("phase_short") or item.get("phase_label")) if isinstance(item, dict) else ""
+            phase_note = _clean(item.get("phase_note")) if isinstance(item, dict) else ""
+            phase_color = _clean(item.get("phase_color")) if isinstance(item, dict) else ""
+            try:
+                phase_order = int(item.get("phase_order")) if isinstance(item, dict) else 9999
+            except (TypeError, ValueError):
+                phase_order = 9999
+            if phase_short and phase_short not in block_phase_labels:
+                block_phase_labels.append(phase_short)
             origin_html = f'<small class="action-origin">Origine : {tip_text(origin)}</small>' if origin else ""
+            phase_style = f' style="border-color:{html.escape(phase_color)};color:{html.escape(phase_color)}"' if phase_color else ""
+            phase_html = f'<small class="action-phase"{phase_style}>{html.escape(phase_short)}</small>' if phase_short else ""
             action_html.append(
-                f'<label class="task"><input type="checkbox" data-action-id="{action_id}"><span>{tip_text(action)}{origin_html}</span></label>'
+                f'<label class="task"><input type="checkbox" data-action-id="{action_id}"><span>{phase_html}{tip_text(action)}{origin_html}</span></label>'
             )
             if action:
-                _all_actions.append((action_id, block["id"], block["priority"], action))
+                _all_actions.append((action_id, block["id"], phase_short, phase_note, phase_color, phase_order, action))
         question = (
             f'<div class="question"><b>Question à transmettre</b><p>{tip_text(block["question"])}</p></div>'
             if block["question"] else ""
@@ -1524,76 +1344,106 @@ def generate_action_plan_html(
             if block.get("gap") else ""
         )
         has_compliance_work = bool(action_html) or bool(block["question"])
+        if len(block_phase_labels) == 1:
+            due_value = block_phase_labels[0]
+        elif len(block_phase_labels) > 1:
+            due_value = _clean(_messages.get("ui_due_multiple_phases")) or "Selon les phases indiquées ci-dessus"
+        else:
+            due_value = _clean(_messages.get("ui_due_no_phase")) or due_default
         if has_compliance_work:
             tasks_block = (
                 f'<div class="tasks">{"".join(action_html)}</div>{question}'
                 '<div class="tracking"><label>Responsable<input data-field="owner" placeholder="À désigner"></label>'
-                '<label>Échéance<input data-field="date" value="Avant dépôt"></label></div>'
+                f'<label>Échéance<input data-field="date" value="{html.escape(due_value)}"></label></div>'
             )
         else:
-            tasks_block = '<p class="compliance-ok">Aucune action supplémentaire : exigence déjà confirmée et capacité démontrée.</p>'
+            _no_action_text = block.get("no_action_note") or no_action_required
+            tasks_block = f'<p class="compliance-ok">{html.escape(_no_action_text)}</p>'
+        coverage_meta_html = (
+            f'<div class="meta-item"><span>{html.escape(requirement_coverage_title)}</span><b>{html.escape(block.get("requirement_coverage_label") or "")}</b></div>'
+            if block.get("has_requirement_coverage") else ""
+        )
+        evidence_rows_html = ""
+        if block.get("evidence"):
+            cards = []
+            for ev in block.get("evidence") or []:
+                source = _clean(ev.get("source"))
+                page = _clean(ev.get("page"))
+                excerpt = _clean(ev.get("text"))
+                source_line = source + (f" - p.{page}" if page else "")
+                cards.append(
+                    f'<div class="retained-proof"><b>{html.escape(source_line)}</b>'
+                    f'<blockquote>{html.escape(excerpt)}</blockquote></div>'
+                )
+            evidence_rows_html = (
+                f'<tr class="evidence-row"><td colspan="3"><div class="evidence-title">{html.escape(evidence_title)}</div>'
+                f'<div class="evidence-list">{"".join(cards)}</div></td></tr>'
+            )
+        meta_rowspan = 3 if evidence_rows_html else 2
         body_rows.append(
             f'<tbody class="action-block" data-status="{html.escape(block["status"])}" '
             f'data-priority="{html.escape(block["priority"])}" data-block="{html.escape(block["id"])}">'
             f'<tr class="content-row">'
-            f'<td class="block-meta" rowspan="2"><strong class="block-code">{html.escape(block["id"])}</strong>'
+            f'<td class="block-meta" rowspan="{meta_rowspan}"><strong class="block-code">{html.escape(block["id"])}</strong>'
             f'<div class="block-title">{tip_text(block["title"])}</div>'
             f'<div class="meta-item"><span>Statut</span><b>{html.escape(block["status"])}</b></div>'
             f'<div class="meta-item"><span>Priorité</span><b>{html.escape(block["priority"])}</b></div>'
-            f'<div class="meta-item"><span>Capacité actuelle</span><b>{html.escape(prep)}</b></div></td>'
+            f'<div class="meta-item"><span>{html.escape(global_capacity_title)}</span><b>{html.escape(prep)}</b></div>'
+            f'{coverage_meta_html}</td>'
             f'<td data-label="Ce qui est demandé"><p>{tip_text(block["demand"])}</p></td>'
-            f'<td data-label="Ce que je suis capable de faire en ce moment"><p class="capacity"><b>{tip_text(prep)}</b></p>'
-            f'<p>{tip_text(block["strength"])}</p>{gap_html}</td>'
+            f'<td data-label="Ce que je suis capable de faire en ce moment"><p class="capacity"><small>{html.escape(global_capacity_title)}</small><br><b>{tip_text(prep)}</b></p>'
+            f'{coverage_html}<p>{tip_text(block["strength"])}</p>{gap_html}</td>'
             f'<td data-label="Ce que je dois répondre"><span class="response-label">{html.escape(block["proposal_label"])}</span>'
             f'<blockquote>{tip_text(block["proposal"])}</blockquote><button class="copy-response" type="button">Copier la réponse</button></td></tr>'
+            f'{evidence_rows_html}'
             f'<tr class="compliance-row"><td colspan="3"><div class="compliance-title">Ce que je dois faire pour être conforme</div>'
             f'<div class="compliance-layout">{tasks_block}</div></td></tr></tbody>'
         )
         all_responses.append(f"{block['id']} - {block['title']}\n{block['proposal']}")
 
-    confirmed = sum(1 for _, result in relevant if _status_key(result) == "CONFIRMÉE")
+    confirmed = sum(1 for _, result in relevant if result.get("public_status_key") == "CONFIRMED")
 
-    # Checklist récapitulative : toutes les actions "à faire", regroupées par
-    # niveau de priorité (Critique / Haute / Avant dépôt / À surveiller). Aucun
-    # de ces niveaux n'empêche à proprement parler de déposer une offre : ce
-    # sont des degrés d'importance à traiter, pas des blocages de dépôt.
-    # Les cases à cocher réutilisent le même data-action-id que le tableau
-    # principal : cocher une ligne ici coche aussi la ligne correspondante
-    # dans le bloc détaillé, et inversement.
-    _ORDRE_PRIORITE = ["Critique", "Haute", "Avant dépôt", "À surveiller"]
-    _groupes: Dict[str, List[str]] = {p: [] for p in _ORDRE_PRIORITE}
-    for action_id, block_id, priority, texte in _all_actions:
-        prio = next((p for p in _ORDRE_PRIORITE if priority.startswith(p)), "À surveiller")
-        _groupes[prio].append(
+    # Checklist récapitulative : regroupement par moment réel de l'action,
+    # indépendamment de la priorité du bloc.
+    _groupes: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for action_id, block_id, phase_short, phase_note, phase_color, phase_order, texte in _all_actions:
+        short = phase_short or "Moment à définir"
+        key = (short, phase_note)
+        group = _groupes.setdefault(key, {"order": phase_order, "color": phase_color, "items": []})
+        group["order"] = min(group["order"], phase_order)
+        if not group.get("color") and phase_color:
+            group["color"] = phase_color
+        group["items"].append(
             f'<label class="task checklist-task"><input type="checkbox" data-action-id="{action_id}">'
             f'<span><b>{html.escape(block_id)}</b> — {tip_text(texte)}</span></label>'
         )
     _sections_checklist = []
-    _CLASSES = {"Critique": "critique", "Haute": "haute", "Avant dépôt": "avant", "À surveiller": "surveiller"}
-    _NOTE = {
-        "Critique": "à traiter avant de finaliser l'offre",
-        "Haute": "à consolider en interne, ne bloque pas le dépôt",
-        "Avant dépôt": "réserve ou question à formuler dans l'offre",
-        "À surveiller": "sans urgence immédiate",
-    }
-    for prio in _ORDRE_PRIORITE:
-        if _groupes[prio]:
+    for (short, note), group in sorted(_groupes.items(), key=lambda item: (item[1]["order"], item[0][0])):
+        items = group["items"]
+        if items:
+            color = _clean(group.get("color"))
+            style_group = f' style="border-left-color:{html.escape(color)}"' if color else ''
+            style_title = f' style="color:{html.escape(color)}"' if color else ''
+            note_html = f' <small>({html.escape(note)})</small>' if note else ''
             _sections_checklist.append(
-                f'<div class="checklist-group checklist-{_CLASSES[prio]}">'
-                f'<h3>{html.escape(prio)} <small>({html.escape(_NOTE[prio])})</small></h3>{"".join(_groupes[prio])}</div>'
+                f'<div class="checklist-group"{style_group}>'
+                f'<h3{style_title}>{html.escape(short)}{note_html}</h3>{"".join(items)}</div>'
             )
     checklist_html = (
-        '<details class="checklist" open><summary>Checklist des actions par niveau de priorité</summary>'
+        '<details class="checklist" open><summary>Checklist des actions à mener</summary>'
         f'<div class="checklist-stack">{"".join(_sections_checklist)}</div></details>'
     ) if _sections_checklist else ""
 
     css = r'''
 :root{--navy:#071C24;--blue:#1F5D8C;--slate:#49697D;--pale:#EAF3F8;--pale2:#F7FAFC;--magenta:#A1003D;--magenta-light:#9C5B45;--text:#17232B;--muted:#667985;--line:#C9D6DE;--green:#176B55;--amber:#A66A12;--white:#fff}
-*{box-sizing:border-box}body{margin:0;background:#f2f5f7;color:var(--text);font:14px/1.48 Calibri,Carlito,"Segoe UI",Arial,sans-serif}button,input{font:inherit}h1,h2,.metric b{font-family:"Calibri Light",Calibri,Carlito,"Segoe UI",Arial,sans-serif}.hero{background:var(--navy);border-bottom:5px solid var(--magenta);padding:27px max(25px,calc((100vw - 1500px)/2));display:flex;align-items:center;gap:22px}.brand{font-size:29px;font-weight:800;color:var(--magenta-light);border-right:1px solid rgba(240,106,154,.45);padding-right:22px}.brand img{max-height:40px;max-width:160px;display:block;object-fit:contain}.hero h1{margin:0;color:var(--magenta-light);font-size:31px;line-height:1;font-weight:700}.hero p{margin:7px 0 0;color:#F5C8D8;font-weight:600}.hero-actions{margin-left:auto;display:flex;gap:8px}.hero-actions button{border:1px solid rgba(240,106,154,.55);background:transparent;color:#F5C8D8;padding:9px 12px;cursor:pointer;font-weight:700}.hero-actions .primary{background:var(--magenta);border-color:var(--magenta);color:#fff}.container{max-width:1500px;margin:0 auto;padding:22px}.summary{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:16px}.metric{position:relative;background:#fff;border:1px solid var(--line);border-radius:6px;padding:16px 18px 16px 20px;box-shadow:0 1px 3px rgba(7,28,36,.06);overflow:hidden;transition:transform .15s,box-shadow .15s}.metric:hover{transform:translateY(-2px);box-shadow:0 6px 14px rgba(7,28,36,.1)}.metric::before{content:"";position:absolute;left:0;top:0;bottom:0;width:5px;border-radius:6px 0 0 6px}.metric b{display:block;font-size:30px;color:var(--navy);font-weight:800;line-height:1}.metric span{display:block;margin-top:5px;font-size:10.5px;text-transform:uppercase;color:var(--muted);font-weight:700;letter-spacing:.03em}.metric-blocks::before{background:var(--blue)}.metric-actions::before{background:var(--magenta-light)}.metric-confirmed::before{background:#3E8A5C}.metric-confirmed b{color:#3E8A5C}.progress-box{background:#fff;border:1px solid var(--line);border-radius:6px;padding:14px 18px;margin-bottom:16px;display:flex;align-items:center;gap:16px;box-shadow:0 1px 3px rgba(7,28,36,.06)}.progress-box strong{color:var(--navy);font-size:13px;white-space:nowrap}.progress{flex:1;height:10px;background:#E5EDF1;border-radius:6px;overflow:hidden}.progress i{display:block;height:100%;background:linear-gradient(90deg,var(--magenta-light),var(--magenta));width:0;border-radius:6px;transition:width .3s ease}.toolbar{display:flex;gap:8px;align-items:center;background:#fff;border:1px solid var(--line);padding:10px 12px;margin-bottom:12px;flex-wrap:wrap}.toolbar button{border:1px solid var(--line);background:#fff;color:var(--navy);padding:7px 10px;cursor:pointer;font-weight:700}.toolbar button.active{background:var(--navy);color:#fff}.toolbar input{margin-left:auto;width:280px;padding:8px;border:1px solid var(--line)}.table-wrap{overflow:visible;background:#fff;border:1px solid var(--line)}table{width:100%;border-collapse:collapse;table-layout:fixed}col.meta{width:18%}col.demand{width:24%}col.capacity{width:27%}col.response{width:31%}.sticky-column-head{position:sticky;top:0;z-index:60;display:grid;grid-template-columns:18% 24% 27% 31%;background:var(--navy);color:#fff;border-bottom:3px solid var(--magenta);box-shadow:0 5px 12px rgba(7,28,36,.22)}.sticky-column-head span{padding:11px 10px;font-size:11px;text-transform:uppercase;letter-spacing:.04em;font-weight:800;border-right:1px solid #39505A}.sticky-column-head span:last-child{border-right:0}thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}.content-row td{vertical-align:top;padding:14px;border-right:1px solid var(--line);border-bottom:1px solid var(--line);border-top:3px solid var(--magenta);overflow-wrap:anywhere}.content-row td:last-child{border-right:0}.block-meta{background:var(--pale);border-right:1px solid var(--blue)!important}.block-code{display:block;color:var(--magenta);font-family:"Calibri Light",Calibri,Carlito,"Segoe UI",Arial,sans-serif;font-size:23px;line-height:1}.block-title{margin:5px 0 18px;color:var(--navy);font-weight:700;font-size:15px}.meta-item{padding:10px 0;border-top:1px solid var(--line)}.meta-item span{display:block;margin-bottom:4px;color:var(--muted);font-size:10px;text-transform:uppercase;font-weight:700}.meta-item b{display:block;color:var(--navy);font-size:12px;line-height:1.35}.content-row p{margin:0 0 8px}.capacity b{color:var(--blue)}.gap,.question{background:var(--pale2);border-left:3px solid var(--blue);padding:8px 9px;margin-top:10px}.gap b,.question b{font-size:10px;text-transform:uppercase;color:var(--magenta)}.gap p,.question p{margin:4px 0 0}.response-label{display:block;color:var(--magenta);font-size:10px;text-transform:uppercase;font-weight:700;margin-bottom:5px}blockquote{margin:0 0 9px;border-left:3px solid var(--magenta);padding-left:10px;color:#314A59}.copy-response{border:1px solid var(--magenta);color:var(--magenta);background:#fff;padding:6px 9px;cursor:pointer;font-weight:700}.compliance-row td{padding:13px 14px 14px;background:var(--pale2);border-bottom:1px solid var(--line);border-top:2px solid var(--blue)}.compliance-title{color:var(--magenta);font-size:11px;text-transform:uppercase;font-weight:800;letter-spacing:.045em;margin-bottom:9px}.compliance-layout{display:block}.tasks{display:block}.task{display:grid;grid-template-columns:18px 1fr;gap:7px;align-items:start;cursor:pointer;margin-bottom:8px}.task input{margin:3px 0 0;accent-color:var(--magenta)}.task input:checked+span{text-decoration:line-through;color:var(--muted)}.action-origin{display:block;margin-top:4px;color:var(--muted);font-size:10px;font-style:italic;text-decoration:none!important}.term-tip{position:relative;display:inline-block;outline:none}.term-tip>span:first-child{border-bottom:1px dotted var(--magenta);cursor:help}.term-bubble{display:none;position:absolute;left:0;bottom:calc(100% + 7px);z-index:100;width:300px;background:var(--navy);color:#fff;padding:10px 11px;font-size:12px;line-height:1.4;text-transform:none;font-weight:400;box-shadow:0 6px 18px rgba(0,0,0,.25)}.term-bubble small{display:block;margin-top:6px;padding-top:5px;border-top:1px solid rgba(255,255,255,.25);color:#F5C8D8}.term-tip:hover .term-bubble,.term-tip:focus .term-bubble{display:block}.tracking{display:block;margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}.tracking label{display:block;font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700;margin-top:8px}.tracking input{width:100%;border:0;border-bottom:1px solid var(--line);padding:5px 0;color:var(--text);text-transform:none;font-weight:400}.action-block.done{opacity:.62}.compliance-ok{margin:0;color:#3E8A5C;font-weight:700}.no-results{background:#fff;border:1px solid var(--line);border-left:4px solid var(--muted);padding:16px;margin-top:12px;color:var(--muted);font-weight:700;text-align:center}
+*{box-sizing:border-box}body{margin:0;background:#f2f5f7;color:var(--text);font:14px/1.48 Calibri,Carlito,"Segoe UI",Arial,sans-serif}button,input{font:inherit}h1,h2,.metric b{font-family:"Calibri Light",Calibri,Carlito,"Segoe UI",Arial,sans-serif}.hero{background:var(--navy);border-bottom:5px solid var(--magenta);padding:27px max(25px,calc((100vw - 1500px)/2));display:flex;align-items:flex-start;gap:22px}.brand{font-size:29px;font-weight:800;color:var(--magenta-light);border-right:1px solid rgba(240,106,154,.45);padding-right:22px}.brand img{max-height:40px;max-width:160px;display:block;object-fit:contain}.hero h1{margin:0;color:var(--magenta-light);font-size:31px;line-height:1;font-weight:700}.hero p{margin:7px 0 0;color:#F5C8D8;font-weight:600}.hero-identity{margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,.14);display:flex;flex-direction:column;gap:6px;max-width:760px}.id-line{display:flex;gap:10px;font-size:12.5px;color:#F5C8D8;line-height:1.3}.id-line span{flex:0 0 150px;color:#8FA3AC;text-transform:uppercase;font-size:9.5px;font-weight:700;letter-spacing:.03em;padding-top:2px}.id-line b{font-weight:600}.hero-actions{margin-left:auto;display:flex;gap:8px}.hero-actions button{border:1px solid rgba(240,106,154,.55);background:transparent;color:#F5C8D8;padding:9px 12px;cursor:pointer;font-weight:700}.hero-actions .primary{background:var(--magenta);border-color:var(--magenta);color:#fff}.container{max-width:1500px;margin:0 auto;padding:22px}.summary{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:16px}.metric{position:relative;background:#fff;border:1px solid var(--line);border-radius:6px;padding:16px 18px 16px 20px;box-shadow:0 1px 3px rgba(7,28,36,.06);overflow:hidden;transition:transform .15s,box-shadow .15s}.metric:hover{transform:translateY(-2px);box-shadow:0 6px 14px rgba(7,28,36,.1)}.metric::before{content:"";position:absolute;left:0;top:0;bottom:0;width:5px;border-radius:6px 0 0 6px}.metric b{display:block;font-size:30px;color:var(--navy);font-weight:800;line-height:1}.metric span{display:block;margin-top:5px;font-size:10.5px;text-transform:uppercase;color:var(--muted);font-weight:700;letter-spacing:.03em}.metric-blocks::before{background:var(--blue)}.metric-actions::before{background:var(--magenta-light)}.metric-confirmed::before{background:#3E8A5C}.metric-confirmed b{color:#3E8A5C}.progress-box{background:#fff;border:1px solid var(--line);border-radius:6px;padding:14px 18px;margin-bottom:16px;display:flex;align-items:center;gap:16px;box-shadow:0 1px 3px rgba(7,28,36,.06)}.progress-box strong{color:var(--navy);font-size:13px;white-space:nowrap}.progress{flex:1;height:10px;background:#E5EDF1;border-radius:6px;overflow:hidden}.progress i{display:block;height:100%;background:linear-gradient(90deg,var(--magenta-light),var(--magenta));width:0;border-radius:6px;transition:width .3s ease}.toolbar{display:flex;gap:8px;align-items:center;background:#fff;border:1px solid var(--line);padding:10px 12px;margin-bottom:12px;flex-wrap:wrap}.toolbar button{border:1px solid var(--line);background:#fff;color:var(--navy);padding:7px 10px;cursor:pointer;font-weight:700}.toolbar button.active{background:var(--navy);color:#fff}.toolbar input{margin-left:auto;width:280px;padding:8px;border:1px solid var(--line)}.table-wrap{overflow:visible;background:#fff;border:1px solid var(--line)}table{width:100%;border-collapse:collapse;table-layout:fixed}col.meta{width:18%}col.demand{width:24%}col.capacity{width:27%}col.response{width:31%}.sticky-column-head{position:sticky;top:0;z-index:60;display:grid;grid-template-columns:18% 24% 27% 31%;background:var(--navy);color:#fff;border-bottom:3px solid var(--magenta);box-shadow:0 5px 12px rgba(7,28,36,.22)}.sticky-column-head span{padding:11px 10px;font-size:11px;text-transform:uppercase;letter-spacing:.04em;font-weight:800;border-right:1px solid #39505A}.sticky-column-head span:last-child{border-right:0}thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}.content-row td{vertical-align:top;padding:14px;border-right:1px solid var(--line);border-bottom:1px solid var(--line);border-top:3px solid var(--magenta);overflow-wrap:anywhere}.content-row td:last-child{border-right:0}.block-meta{background:var(--pale);border-right:1px solid var(--blue)!important}.block-code{display:block;color:var(--magenta);font-family:"Calibri Light",Calibri,Carlito,"Segoe UI",Arial,sans-serif;font-size:23px;line-height:1}.block-title{margin:5px 0 18px;color:var(--navy);font-weight:700;font-size:15px}.meta-item{padding:10px 0;border-top:1px solid var(--line)}.meta-item span{display:block;margin-bottom:4px;color:var(--muted);font-size:10px;text-transform:uppercase;font-weight:700}.meta-item b{display:block;color:var(--navy);font-size:12px;line-height:1.35}.content-row p{margin:0 0 8px}.capacity b{color:var(--blue)}.capacity small{font-size:9px;text-transform:uppercase;color:var(--muted);font-weight:800}.coverage{background:#F4F8FA;border-left:3px solid var(--magenta);padding:8px 9px;margin:8px 0}.coverage b{font-size:10px;text-transform:uppercase;color:var(--magenta)}.coverage p{margin:3px 0 0!important;color:var(--navy);font-weight:800;font-size:15px}.gap,.question{background:var(--pale2);border-left:3px solid var(--blue);padding:8px 9px;margin-top:10px}.gap b,.question b{font-size:10px;text-transform:uppercase;color:var(--magenta)}.gap p,.question p{margin:4px 0 0}.response-label{display:block;color:var(--magenta);font-size:10px;text-transform:uppercase;font-weight:700;margin-bottom:5px}blockquote{margin:0 0 9px;border-left:3px solid var(--magenta);padding-left:10px;color:#314A59}.copy-response{border:1px solid var(--magenta);color:var(--magenta);background:#fff;padding:6px 9px;cursor:pointer;font-weight:700}.evidence-row td{padding:10px 14px;background:#F8FAFB;border-bottom:1px solid var(--line)}.evidence-title{color:var(--magenta);font-size:10px;text-transform:uppercase;font-weight:800;letter-spacing:.04em;margin-bottom:6px}.evidence-list{display:grid;gap:7px}.retained-proof{border-left:3px solid var(--blue);padding:6px 9px;background:#fff}.retained-proof b{font-size:10px;color:var(--navy)}.retained-proof blockquote{margin:4px 0 0;border-left:0;padding-left:0;color:#314A59;font-size:12px}.compliance-row td{padding:13px 14px 14px;background:var(--pale2);border-bottom:1px solid var(--line);border-top:2px solid var(--blue)}.compliance-title{color:var(--magenta);font-size:11px;text-transform:uppercase;font-weight:800;letter-spacing:.045em;margin-bottom:9px}.compliance-layout{display:block}.tasks{display:block}.task{display:grid;grid-template-columns:18px 1fr;gap:7px;align-items:start;cursor:pointer;margin-bottom:8px}.task input{margin:3px 0 0;accent-color:var(--magenta)}.task input:checked+span{text-decoration:line-through;color:var(--muted)}.action-origin{display:block;margin-top:4px;color:var(--muted);font-size:10px;font-style:italic;text-decoration:none!important}.action-phase{display:inline-block;margin:0 7px 4px 0;padding:2px 6px;border:1px solid var(--blue);border-radius:10px;color:var(--blue);font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.02em}.term-tip{position:relative;display:inline-block;outline:none}.term-tip>span:first-child{border-bottom:1px dotted var(--magenta);cursor:help}.term-bubble{display:none;position:absolute;left:0;bottom:calc(100% + 7px);z-index:100;width:300px;background:var(--navy);color:#fff;padding:10px 11px;font-size:12px;line-height:1.4;text-transform:none;font-weight:400;box-shadow:0 6px 18px rgba(0,0,0,.25)}.term-bubble small{display:block;margin-top:6px;padding-top:5px;border-top:1px solid rgba(255,255,255,.25);color:#F5C8D8}.term-tip:hover .term-bubble,.term-tip:focus .term-bubble{display:block}.tracking{display:block;margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}.tracking label{display:block;font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700;margin-top:8px}.tracking input{width:100%;border:0;border-bottom:1px solid var(--line);padding:5px 0;color:var(--text);text-transform:none;font-weight:400}.action-block.done{opacity:.62}.compliance-ok{margin:0;color:#3E8A5C;font-weight:700}.no-results{background:#fff;border:1px solid var(--line);border-left:4px solid var(--muted);padding:16px;margin-top:12px;color:var(--muted);font-weight:700;text-align:center}
 .checklist{background:#fff;border:1px solid var(--line);padding:16px 18px;margin-bottom:14px;box-shadow:0 1px 3px rgba(7,28,36,.05)}.checklist summary{cursor:pointer;font-weight:800;color:var(--navy);text-transform:uppercase;font-size:12.5px;letter-spacing:.04em;display:flex;align-items:center;gap:8px}.checklist summary::before{content:"☰";color:var(--magenta-light);font-size:14px}.checklist-stack{display:flex;flex-direction:column;gap:14px;margin-top:14px}.checklist-group{background:var(--pale2);border-left:4px solid var(--line);border-radius:0 4px 4px 0;padding:12px 14px}.checklist-group h3{margin:0 0 10px;font-size:11.5px;text-transform:uppercase;letter-spacing:.03em;color:var(--navy);font-weight:800;display:flex;align-items:baseline;gap:6px}.checklist-group h3 small{color:var(--muted);text-transform:none;font-weight:400;font-size:11px}.checklist-task{display:grid;grid-template-columns:18px 1fr;gap:9px;align-items:start;padding:6px 4px;border-radius:3px;cursor:pointer;transition:background .12s}.checklist-task:hover{background:rgba(255,255,255,.75)}.checklist-task+.checklist-task{border-top:1px solid rgba(201,214,222,.6)}.checklist-task input{margin-top:2px;width:15px;height:15px;accent-color:var(--magenta-light)}.checklist-task span{line-height:1.45}.checklist-task span b{color:var(--navy);font-weight:800}.checklist-task input:checked+span{text-decoration:line-through;color:var(--muted)}.checklist-critique{border-left-color:#8A3B2E}.checklist-critique h3{color:#8A3B2E}.checklist-haute{border-left-color:var(--magenta-light)}.checklist-haute h3{color:var(--magenta-light)}.checklist-avant{border-left-color:var(--blue)}.checklist-avant h3{color:var(--blue)}.checklist-surveiller{border-left-color:var(--muted)}.checklist-surveiller h3{color:var(--muted)}
 @media print{.checklist{break-inside:avoid}}
 @media(max-width:950px){.hero{flex-wrap:wrap}.sticky-column-head{display:none}.hero-actions{margin-left:0}.summary{grid-template-columns:1fr}.progress-box{flex-direction:column;align-items:stretch}.toolbar input{margin-left:0;width:100%}.table-wrap{overflow:visible;border:0;background:transparent}table,thead,tbody,tr,th,td{display:block}thead{display:none}.action-block{display:block;margin-bottom:14px;border:1px solid var(--line);background:#fff}.block-meta{display:block;border-right:0!important}.content-row td{border-right:0;padding:12px}.content-row td::before{content:attr(data-label);display:block;font-size:10px;text-transform:uppercase;color:var(--magenta);font-weight:700;margin-bottom:7px}.block-meta::before{display:none!important}.compliance-row td{display:block}}
 @media print{body{background:#fff;font-size:10px}.hero{background:#fff;border-bottom:2px solid var(--magenta);padding:8px 0}.brand,.hero h1{color:var(--navy)}.hero p{color:var(--muted)}.hero-actions,.toolbar,.copy-response{display:none!important}.container{max-width:none;padding:8px 0}.summary{grid-template-columns:repeat(3,1fr)}.table-wrap{overflow:visible}thead th{position:static}.action-block{break-inside:avoid}}
+/* Extension CCAP : seul ajout visuel au style de la version en ligne de référence. */
+.document-order .doc-order-message{margin:10px 0;color:var(--text)}.doc-order-list{border-top:1px solid var(--line);margin-top:8px}.doc-order-item{display:grid;grid-template-columns:45px 1fr 70px;gap:10px;padding:7px 4px;border-bottom:1px solid var(--line);align-items:start}.doc-order-item b{color:var(--magenta)}.doc-order-item small{color:var(--muted);text-align:right}.doc-order-source{margin-top:8px;color:var(--muted);font-size:10px;font-style:italic}
+@media(max-width:950px){.doc-order-item{grid-template-columns:35px 1fr 55px}}
 '''
     script = f'''
 const KEY={json.dumps(storage_key)};const blocks=[...document.querySelectorAll('.action-block')];const checks=[...document.querySelectorAll('[data-action-id]')];const fields=[...document.querySelectorAll('[data-field]')];
@@ -1610,16 +1460,103 @@ checks.forEach(c=>c.addEventListener('change',()=>{{syncAction(c.dataset.actionI
     else:
         brand_html = html.escape(str(meta.get("marque") or meta.get("entreprise") or "Entreprise"))
 
+    _identity_items = [item for item in [
+        ("Projet", meta.get("nom_projet")),
+        ("Entreprise", meta.get("entreprise")),
+        ("Lot", meta.get("lot")),
+        ("Documents analysés", meta.get("documents_analyses") or meta.get("documents_resume")),
+        ("Adresse", meta.get("adresse")),
+        ("Email", meta.get("email")),
+        ("Analyse réalisée par", meta.get("analyste")),
+        ("Date", meta.get("date")),
+    ] if item[1]]
+    identity_html = (
+        '<div class="hero-identity">' +
+        "".join(f'<div class="id-line"><span>{html.escape(label)}</span><b>{html.escape(str(value))}</b></div>' for label, value in _identity_items) +
+        '</div>'
+    ) if _identity_items else ""
+
+    priority_filter_buttons = "".join(
+        f'<button data-filter="{html.escape(group["short"])}" type="button">{html.escape(group["short"])}</button>'
+        for group in _priority_groups(blocks)
+        if group.get("short")
+    )
+    ccap_html = _ccap_reperage_html_action(meta)
+    _vig = meta.get("points_vigilance") or []
+    _vig_title = _clean((meta.get("messages") or {}).get("vigilance_section_title")) or "Points de vigilance documentaires"
+    vigilance_html = ""
+    if _vig:
+        _source_label = _clean((meta.get("messages") or {}).get("vigilance_source_label")) or "Source"
+        _excerpt_label = _clean((meta.get("messages") or {}).get("vigilance_excerpt_label")) or "Extrait"
+        _occurrences_label = _clean((meta.get("messages") or {}).get("vigilance_occurrences_label")) or "Citations"
+        _other_group = _clean((meta.get("messages") or {}).get("vigilance_other_group_label")) or "Autres vigilances documentaires"
+        _groups = {}
+        for v in _vig:
+            _label = _clean(v.get("reference_display_group")) if _clean(v.get("type")) == "missing_reference" else ""
+            if not _label:
+                _label = _other_group
+            try:
+                _order = int(float(v.get("reference_display_order") or 999))
+            except (TypeError, ValueError):
+                _order = 999
+            _bucket = _groups.setdefault(_label, {"order": _order, "items": []})
+            _bucket["order"] = min(_bucket["order"], _order)
+            _bucket["items"].append(v)
+        _group_parts = []
+        for _group_label, _group_data in sorted(_groups.items(), key=lambda kv: (kv[1]["order"], kv[0].casefold())):
+            _row_parts = []
+            for v in _group_data["items"]:
+                occurrences = list(v.get("occurrences") or [])
+                if occurrences:
+                    grouped = {}
+                    source_order = []
+                    excerpt_samples = []
+                    for occ in occurrences:
+                        source = _clean(occ.get("source")) or "Document"
+                        page = _clean(occ.get("page"))
+                        excerpt = _clean(occ.get("excerpt"))
+                        if source not in grouped:
+                            grouped[source] = []
+                            source_order.append(source)
+                        if page and page not in grouped[source]:
+                            grouped[source].append(page)
+                        if excerpt and len(excerpt_samples) < 2:
+                            excerpt_samples.append((source, page, excerpt))
+                    locations = " ; ".join(src + ((" — p." + ", ".join(grouped[src])) if grouped[src] else "") for src in source_order)
+                    trace = f'<div style="margin-top:5px;color:#49697D;font-size:11px"><b>{html.escape(_occurrences_label)} :</b> {html.escape(locations)}</div>'
+                    sample_parts = []
+                    for source, page, excerpt in excerpt_samples:
+                        sample_label = source + (f" — p.{page}" if page else "")
+                        sample_parts.append(f'<div style="margin-top:5px;padding-left:9px;border-left:2px solid #DCE5EA;color:#49697D;font-size:11px"><b>{html.escape(_excerpt_label)} ({html.escape(sample_label)}) :</b> {html.escape(excerpt)}</div>')
+                    excerpt_html = "".join(sample_parts)
+                else:
+                    source = _clean(v.get("source"))
+                    page = _clean(v.get("page"))
+                    excerpt = _clean(v.get("excerpt"))
+                    source_line = source + (f" — p.{page}" if page else "")
+                    trace = f'<div style="margin-top:5px;color:#49697D;font-size:11px"><b>{html.escape(_source_label)} :</b> {html.escape(source_line)}</div>' if source_line else ""
+                    excerpt_html = f'<div style="margin-top:4px;color:#314A59;font-size:11px"><b>{html.escape(_excerpt_label)} :</b> {html.escape(excerpt)}</div>' if excerpt else ""
+                _row_parts.append(
+                    f'<div style="padding:10px 12px;border-bottom:1px solid #DCE5EA"><b style="color:var(--magenta)">{html.escape(str(v.get("title") or "Point de vigilance"))}</b><div style="margin-top:4px">{html.escape(str(v.get("text") or ""))}</div>{trace}{excerpt_html}</div>'
+                )
+            _group_parts.append(
+                f'<div style="margin:0 0 10px;border:1px solid #DCE5EA"><div style="padding:8px 10px;background:var(--pale2);border-left:4px solid var(--magenta);color:var(--magenta);font-weight:800;text-transform:uppercase;font-size:10.5px">{html.escape(_group_label)}</div>{"".join(_row_parts)}</div>'
+            )
+        vigilance_html = f'<section style="background:#fff;border:1px solid #DCE5EA;margin-bottom:16px"><div style="padding:11px 13px;background:#F8EAF0;color:#071C24;font-weight:800">{html.escape(_vig_title)}</div><div style="padding:10px">{"".join(_group_parts)}</div></section>'
+    subtitle_prefix = " - ".join(x for x in [_clean(meta.get("entreprise")), (f"Lot {_clean(meta.get('lot'))}" if _clean(meta.get('lot')) else "")] if x)
+    hero_subtitle = (subtitle_prefix + " - " if subtitle_prefix else "") + "Demande, capacité et réponse par exigence, avec suivi de mise en conformité"
+
     doc = (
         '<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
         f'<title>Plan d\'actions BIM - {html.escape(str(meta.get("projet", "")))}</title><style>{css}</style></head><body>'
-        f'<header class="hero"><div class="brand">{brand_html}</div><div><h1>PLAN D\'ACTIONS AVANT LE DÉPÔT</h1>'
-        f'<p>{html.escape(str(meta.get("entreprise", "-")))} - Lot {html.escape(str(meta.get("lot", "-")))} - Demande, capacité et réponse par exigence, avec suivi de mise en conformité</p></div>'
+        f'<header class="hero"><div class="brand">{brand_html}</div><div><h1>{html.escape(_clean(_messages.get("ui_action_plan_title_short")) or "PLAN D’ACTIONS — OFFRE ET EXÉCUTION")}</h1>'
+        f'<p>{html.escape(hero_subtitle)}</p>{identity_html}</div>'
         '<div class="hero-actions"><button id="copyAll" type="button">Copier toutes les réponses</button><button id="reset" type="button">Réinitialiser</button></div></header>'
-        f'<main class="container"><section class="summary"><div class="metric metric-blocks"><b>{len(blocks)}</b><span>Blocs à traiter</span></div><div class="metric metric-actions"><b>{action_count}</b><span>Actions identifiées</span></div><div class="metric metric-confirmed"><b>{confirmed}</b><span>Obligations confirmées</span></div></section>'
+        f'<main class="container"><section class="summary"><div class="metric metric-blocks"><b>{len(blocks)}</b><span>{html.escape(metric_blocks_label)}</span></div><div class="metric metric-actions"><b>{action_count}</b><span>{html.escape(metric_actions_label)}</span></div><div class="metric metric-confirmed"><b>{confirmed}</b><span>{html.escape(metric_confirmed_label)}</span></div></section>'
         f'<section class="progress-box"><strong id="progressText">0 / {action_count} actions réalisées</strong><div class="progress"><i id="progressBar"></i></div></section>'
+        f'{ccap_html}{vigilance_html}'
         f'{checklist_html}'
-        '<div class="toolbar"><button class="active" data-filter="all" type="button">Tous</button><button data-filter="Critique" type="button">Critique</button><button data-filter="Haute" type="button">Haute</button><button data-filter="Avant dépôt" type="button">Avant dépôt</button><button data-filter="À surveiller" type="button">À surveiller</button><input id="search" placeholder="Rechercher un bloc, une demande ou une action"></div>'
+        f'<div class="toolbar"><button class="active" data-filter="all" type="button">Tous</button>{priority_filter_buttons}<input id="search" placeholder="Rechercher un bloc, une demande ou une action"></div>'
         f'<div class="table-wrap"><div class="sticky-column-head"><span>Bloc</span><span>Ce qui est demandé</span><span>Ce que je suis capable de faire en ce moment</span><span>Ce que je dois répondre</span></div><table><colgroup><col class="meta"><col class="demand"><col class="capacity"><col class="response"></colgroup><thead><tr><th>Bloc</th><th>Ce qui est demandé</th><th>Ce que je suis capable de faire en ce moment</th><th>Ce que je dois répondre</th></tr></thead>{"".join(body_rows)}</table></div>'
         '<p id="noResults" class="no-results" hidden>Aucun bloc ne correspond à ce filtre pour ce lot.</p>'
         '</main>'
@@ -1638,81 +1575,76 @@ from bim_model import ensure_public_model as _ensure_public_model
 
 
 def _status_key(result: Dict[str, Any]) -> str:
-    public = result.get("public_status_key")
-    return {
-        "CONFIRMED": "CONFIRMÉE",
-        "CLARIFY": "PROBABLE",
-        "UNDEMONSTRATED": "NON DÉMONTRÉE",
-        "EXCLUDED": "NON APPLICABLE",
-    }.get(public, _clean(result.get("statut", "")).upper())
+    # Le statut public est calculé par 17_Regles_Restitution ; le rapport ne
+    # traduit plus ce code vers une seconde nomenclature métier.
+    return _clean(result.get("public_status_key"))
 
 
 def _status_info(result: Dict[str, Any]) -> Tuple[str, colors.Color, colors.Color]:
-    key = result.get("public_status_key")
-    if key == "CONFIRMED":
-        return result.get("public_status_label", "Confirmée pour le lot"), GREEN, GREEN_BG
-    if key == "CLARIFY":
-        return result.get("public_status_label", "À confirmer pour le lot"), AMBER, AMBER_BG
-    if key == "UNDEMONSTRATED":
-        return result.get("public_status_label", "Non démontrée dans les documents"), SLATE, SOFT
-    if key == "EXCLUDED":
-        return result.get("public_status_label", "Non applicable / explicitement exclue"), MUTED, SOFT
-    return _status_info.__wrapped__(result) if hasattr(_status_info, "__wrapped__") else (_clean(result.get("statut")) or "À examiner", SLATE, SOFT)
+    key = _clean(result.get("public_status_key"))
+    label = _clean(result.get("public_status_label")) or _clean(result.get("statut"))
+    # Couleurs = thème historique du livrable ; le choix du statut vient d'Excel.
+    palette = {
+        "CONFIRMED": (GREEN, GREEN_BG),
+        "CLARIFY": (AMBER, AMBER_BG),
+        "UNDEMONSTRATED": (SLATE, SOFT),
+        "EXCLUDED": (MUTED, SOFT),
+    }
+    fg, bg = palette.get(key, (SLATE, SOFT))
+    return label, fg, bg
 
 
 def _v4_status(result: Dict[str, Any]) -> Tuple[str, colors.Color, colors.Color]:
-    key = result.get("public_status_key")
-    if key == "CONFIRMED":
-        return result.get("public_status_label", "Confirmée pour le lot"), V4_GREEN, V4_GREEN_BG
-    if key == "CLARIFY":
-        return result.get("public_status_label", "À confirmer pour le lot"), V4_AMBER, V4_AMBER_BG
-    if key == "UNDEMONSTRATED":
-        return result.get("public_status_label", "Non démontrée dans les documents"), V4_SLATE, V4_PALE
-    if key == "EXCLUDED":
-        return result.get("public_status_label", "Non applicable / explicitement exclue"), V4_MUTED, colors.HexColor("#F0F3F5")
-    return _clean(result.get("statut")) or "À vérifier", V4_SLATE, V4_PALE
+    key = _clean(result.get("public_status_key"))
+    label = _clean(result.get("public_status_label")) or _clean(result.get("statut"))
+    palette = {
+        "CONFIRMED": (V4_GREEN, V4_GREEN_BG),
+        "CLARIFY": (V4_AMBER, V4_AMBER_BG),
+        "UNDEMONSTRATED": (V4_SLATE, V4_PALE),
+        "EXCLUDED": (V4_MUTED, colors.HexColor("#F0F3F5")),
+    }
+    fg, bg = palette.get(key, (V4_SLATE, V4_PALE))
+    return label, fg, bg
 
 
 def _capacity_info(block_id: str, scores: Dict[str, Dict[str, Any]], result: Dict[str, Any] | None = None) -> Tuple[str, Optional[int], colors.Color, colors.Color]:
     result = result or {}
-    label = result.get("public_capacity_label")
+    label = _clean(result.get("public_capacity_label"))
     pct = result.get("public_capacity_pct")
-    state = result.get("public_capacity_state")
-    if label:
-        if state == "DEMONSTRATED":
-            return label.replace(f" - {pct} %", ""), pct, GREEN, GREEN_BG
-        if state == "PARTIAL":
-            return label.replace(f" - {pct} %", ""), pct, AMBER, AMBER_BG
-        if state == "NOT_DEMONSTRATED":
-            return label.replace(f" - {pct} %", ""), pct, RED, RED_BG
-        return label, None, MUTED, SOFT
-    score = scores.get(block_id) or {}
-    raw = score.get("pct")
-    if isinstance(raw, (int, float)):
-        pct = int(round(raw))
-        if pct >= 70:
-            return "Capacité en place", pct, GREEN, GREEN_BG
-        if pct >= 40:
-            return "Capacité partielle", pct, AMBER, AMBER_BG
-        return "Capacité à développer", pct, RED, RED_BG
-    return "Évaluation non disponible pour ce bloc", None, MUTED, SOFT
+    state = _clean(result.get("public_capacity_state"))
+    if isinstance(pct, (int, float)):
+        pct = int(round(float(pct)))
+        suffix = f" - {pct} %"
+        if label.endswith(suffix):
+            label = label[:-len(suffix)]
+    else:
+        pct = None
+    # Couleurs conservées du rapport historique ; la catégorie est déterminée par 16_Axes_Config.
+    palette = {
+        "DEMONTREE": (GREEN, GREEN_BG),
+        "PARTIELLE": (AMBER, AMBER_BG),
+        "NON_DEMONTREE": (RED, RED_BG),
+        "NON_EVALUEE": (MUTED, SOFT),
+    }
+    fg, bg = palette.get(state, (MUTED, SOFT))
+    return label, pct, fg, bg
 
 
 def _priority(result: Dict[str, Any], block_id: str, scores: Dict[str, Dict[str, Any]]) -> Tuple[int, str]:
-    label = result.get("public_priority")
-    group = result.get("public_group_order", 99)
-    if label:
-        return int(group), label
-    return 99, "À examiner"
+    label = _clean(result.get("public_priority_short") or result.get("public_priority"))
+    try:
+        order = int(result.get("public_priority_order"))
+    except (TypeError, ValueError):
+        order = 9999
+    return order, label
 
 
 def _plain_title(block_id: str, result: Dict[str, Any]) -> str:
-    excel_title = _clean((result.get("bloc") or {}).get("titre_bloc"))
-    return _plain_language(result.get("public_title") or excel_title or _FALLBACK_PLAIN_TITLES.get(block_id) or block_id)
+    return _plain_language(result.get("public_title") or _clean((result.get("bloc") or {}).get("titre_bloc")) or block_id)
 
 
 def _relevant_items(results: Dict[str, Dict[str, Any]], scores: Dict[str, Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
-    items = [(bid, res) for bid, res in results.items() if res.get("public_status_key") != "EXCLUDED"]
+    items = [(bid, res) for bid, res in results.items()]
     return sorted(items, key=lambda item: (item[1].get("public_group_order", 99), _model_block_sort_key(item[0])))
 
 
@@ -1731,7 +1663,7 @@ def _proposal_for(block_id: str, proposals: Dict[str, Dict[str, Any]], result: D
 def _situation_summary(block_id: str, scores: Dict[str, Dict[str, Any]], result: Dict[str, Any] | None = None) -> Tuple[str, str]:
     if result and result.get("public_capacity_strength"):
         return _plain_language(result.get("public_capacity_strength")), _plain_language(result.get("public_capacity_gap"))
-    return "Évaluation non disponible pour ce bloc.", "Compléter le paramétrage de l'auto-évaluation."
+    return "", ""
 
 
 def _v4_source(result: Dict[str, Any]) -> str:
@@ -1752,29 +1684,39 @@ def _v5_action_block_data(
     _, priority = _priority(result, block_id, scores)
     capacity_label, pct, _, _ = _capacity_info(block_id, scores, result)
     strength, gap = _situation_summary(block_id, scores, result)
-    demand = _plain_language(
-        result.get("public_demand")
-        or block.get("lecture_entreprise")
-        or block.get("description_convention")
-        or result.get("conclusion")
-        or "L'attente exacte n'est pas suffisamment explicite dans les extraits retenus."
-    )
+    demand = _plain_language(result.get("public_demand") or block.get("lecture_entreprise") or result.get("conclusion"))
+    source = _v4_source(result)
+    if result.get("public_status_key") == "EXCLUDED" and result.get("public_evidence"):
+        demand = (demand + "\nOrigine : " + source).strip()
     proposal_label, proposal = _proposal_for(block_id, proposals, result)
+    actions = _actions_for(block_id, result, scores)
     return {
         "id": block_id,
         "title": _plain_title(block_id, result),
         "status": status_label,
         "priority": priority,
+        "priority_code": _clean(result.get("public_priority_code")),
+        "priority_order": result.get("public_priority_order"),
+        "priority_short": _clean(result.get("public_priority_short")) or priority,
+        "priority_note": _clean(result.get("public_priority_note")),
+        "priority_color": _clean(result.get("public_priority_color")),
         "capacity_label": capacity_label,
         "pct": pct,
+        "requirement_coverage_label": _clean(result.get("public_requirement_coverage_label")),
+        "requirement_coverage_pct": result.get("public_requirement_coverage_pct"),
+        "has_requirement_coverage": bool(result.get("public_requirement_question_ids")),
         "strength": strength,
         "gap": gap,
         "demand": demand,
         "proposal_label": proposal_label,
-        "proposal": proposal or "Aucune formulation ferme ne doit être intégrée en l'état.",
-        "actions": _actions_for(block_id, result, scores),
-        "action_items": result.get("public_action_items") or [{"text": action, "origin": ""} for action in _actions_for(block_id, result, scores)],
+        "proposal": proposal,
+        "actions": actions,
+        "action_items": result.get("public_action_items") or [],
         "question": _plain_language(result.get("public_question") or ""),
+        "no_action_note": _plain_language(result.get("interblock_reason") or ""),
+        # La preuve publique est le même objet canonique que celui utilisé par
+        # le Dashboard. Le Plan ne reconstruit ni source, ni page, ni extrait.
+        "evidence": [dict(item) for item in (result.get("public_evidence") or [])],
     }
 
 
@@ -1783,35 +1725,44 @@ _generate_action_plan_pdf_v6 = generate_action_plan_pdf
 _generate_action_plan_html_v6 = generate_action_plan_html
 
 
+def _vigilance_pdf(meta: Dict[str, Any], width_mm: float) -> List[Any]:
+    items = meta.get("points_vigilance") or []
+    if not items:
+        return []
+    messages = meta.get("messages") or {}
+    title = _clean(messages.get("vigilance_section_title")) or "Points de vigilance documentaires"
+    out: List[Any] = [_para(title.upper(), V4["h2"]), Spacer(1, 4)]
+    rows = []
+    for item in items:
+        rows.append([
+            _rich_para(_esc(item.get("title") or "Point de vigilance"), V4["table_bold"]),
+            _rich_para(_esc(item.get("text") or ""), V4["small"]),
+        ])
+    t = Table(rows, colWidths=[48*mm, max(40*mm, width_mm*mm-48*mm)])
+    t.setStyle(TableStyle([
+        ("VALIGN",(0,0),(-1,-1),"TOP"), ("GRID",(0,0),(-1,-1),0.25,V4_LINE),
+        ("BACKGROUND",(0,0),(0,-1),V4_PALE), ("LEFTPADDING",(0,0),(-1,-1),5),
+        ("RIGHTPADDING",(0,0),(-1,-1),5), ("TOPPADDING",(0,0),(-1,-1),5),
+        ("BOTTOMPADDING",(0,0),(-1,-1),5),
+    ]))
+    out += [t, Spacer(1, 8)]
+    return out
+
+
 def generate_action_plan_pdf(out, results, scores, proposals, meta):
-    _ensure_public_model(results, scores, proposals, lot=str(meta.get("lot", "")), axes_config=meta.get("axes_config"))
+    _ensure_public_model(results, scores, proposals, lot=str(meta.get("lot", "")), axes_config=meta.get("axes_config"), restitution_rules=meta.get("restitution_rules"), messages=meta.get("messages"))
     return _generate_action_plan_pdf_v6(out, results, scores, proposals, meta)
 
 
 def generate_action_plan_html(out, results, scores, proposals, meta):
-    _ensure_public_model(results, scores, proposals, lot=str(meta.get("lot", "")), axes_config=meta.get("axes_config"))
+    _ensure_public_model(results, scores, proposals, lot=str(meta.get("lot", "")), axes_config=meta.get("axes_config"), restitution_rules=meta.get("restitution_rules"), messages=meta.get("messages"))
     return _generate_action_plan_html_v6(out, results, scores, proposals, meta)
 
 
 def _situation_summary(block_id: str, scores: Dict[str, Dict[str, Any]], result: Dict[str, Any] | None = None) -> Tuple[str, str]:
-    if result and result.get("public_capacity_strength"):
-        return _plain_language(result.get("public_capacity_strength")), _plain_language(result.get("public_capacity_gap"))
-    score = scores.get(block_id) or {}
-    responses = score.get("reponses") or []
-    if not responses:
-        return "Évaluation non disponible pour ce bloc.", "Compléter le paramétrage de l'auto-évaluation avant de conclure sur la capacité."
-    strengths, gaps = [], []
-    for response in responses:
-        value = response.get("reponse_val")
-        label = _clean(response.get("reponse_label") or response.get("question"))
-        if value == 2 and label:
-            strengths.append(label)
-        elif value in (0, 1) and label:
-            gaps.append(label)
-    return (
-        _plain_language(strengths[0]) if strengths else "Aucun point fort suffisamment démontré dans les réponses fournies.",
-        _plain_language(gaps[0]) if gaps else "Aucun écart majeur identifié dans les réponses fournies.",
-    )
+    if result:
+        return _plain_language(result.get("public_capacity_strength") or ""), _plain_language(result.get("public_capacity_gap") or "")
+    return "", ""
 
 
 def _canonical_proposals(results: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -1826,116 +1777,245 @@ def _canonical_proposals(results: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[s
     }
 
 
+def _vigilance_pdf(meta: Dict[str, Any], width_mm: float) -> List[Any]:
+    items = meta.get("points_vigilance") or []
+    if not items:
+        return []
+    messages = meta.get("messages") or {}
+    title = _clean(messages.get("vigilance_section_title")) or "Points de vigilance documentaires"
+    source_label = _clean(messages.get("vigilance_source_label")) or "Source"
+    excerpt_label = _clean(messages.get("vigilance_excerpt_label")) or "Extrait"
+    occurrences_label = _clean(messages.get("vigilance_occurrences_label")) or "Citations"
+    other_group = _clean(messages.get("vigilance_other_group_label")) or "Autres vigilances documentaires"
+    out: List[Any] = [_para(title.upper(), V4["h2"]), Spacer(1, 4)]
+    groups = {}
+    for item in items:
+        label = _clean(item.get("reference_display_group")) if _clean(item.get("type")) == "missing_reference" else ""
+        if not label:
+            label = other_group
+        try:
+            order = int(float(item.get("reference_display_order") or 999))
+        except (TypeError, ValueError):
+            order = 999
+        bucket = groups.setdefault(label, {"order": order, "items": []})
+        bucket["order"] = min(bucket["order"], order)
+        bucket["items"].append(item)
+    group_style = ParagraphStyle("vigilance_group_c44", parent=V4["table_bold"], textColor=V4_MAGENTA, fontSize=8.2, leading=10.0, spaceBefore=2, spaceAfter=3)
+    label_style = ParagraphStyle("vigilance_label_c44", parent=V4["table_bold"], textColor=V4_MAGENTA)
+    for group_label, group_data in sorted(groups.items(), key=lambda kv: (kv[1]["order"], kv[0].casefold())):
+        out.append(_rich_para(_esc(group_label.upper()), group_style))
+        rows = []
+        for item in group_data["items"]:
+            details = [_esc(item.get("text") or "")]
+            occurrences = list(item.get("occurrences") or [])
+            if occurrences:
+                grouped = {}
+                source_order = []
+                for occ in occurrences:
+                    source = _clean(occ.get("source")) or "Document"
+                    page = _clean(occ.get("page"))
+                    if source not in grouped:
+                        grouped[source] = []
+                        source_order.append(source)
+                    if page and page not in grouped[source]:
+                        grouped[source].append(page)
+                locations = " ; ".join(source + ((" — p." + ", ".join(grouped[source])) if grouped[source] else "") for source in source_order)
+                if locations:
+                    details.append(f"<b>{_esc(occurrences_label)} :</b> {_esc(locations)}")
+            else:
+                source = _clean(item.get("source"))
+                page = _clean(item.get("page"))
+                excerpt = _clean(item.get("excerpt"))
+                source_line = source + (f" — p.{page}" if page else "")
+                if source_line:
+                    details.append(f"<b>{_esc(source_label)} :</b> {_esc(source_line)}")
+                if excerpt:
+                    details.append(f"<b>{_esc(excerpt_label)} :</b> {_esc(excerpt)}")
+            rows.append([
+                _rich_para(_esc(item.get("title") or "Point de vigilance"), label_style),
+                _rich_para("<br/>".join(details), V4["small"]),
+            ])
+        t = Table(rows, colWidths=[48*mm, max(40*mm, width_mm*mm-48*mm)])
+        t.setStyle(TableStyle([
+            ("VALIGN",(0,0),(-1,-1),"TOP"), ("GRID",(0,0),(-1,-1),0.25,V4_LINE),
+            ("BACKGROUND",(0,0),(0,-1),V4_PALE), ("LEFTPADDING",(0,0),(-1,-1),5),
+            ("RIGHTPADDING",(0,0),(-1,-1),5), ("TOPPADDING",(0,0),(-1,-1),5),
+            ("BOTTOMPADDING",(0,0),(-1,-1),5),
+        ]))
+        out += [t, Spacer(1, 6)]
+    out.append(Spacer(1, 2))
+    return out
+
 def generate_action_plan_pdf(out, results, scores, proposals, meta):
-    _ensure_public_model(results, scores, proposals, lot=str(meta.get("lot", "")), axes_config=meta.get("axes_config"))
+    _ensure_public_model(results, scores, proposals, lot=str(meta.get("lot", "")), axes_config=meta.get("axes_config"), restitution_rules=meta.get("restitution_rules"), messages=meta.get("messages"))
     return _generate_action_plan_pdf_v6(out, results, scores, _canonical_proposals(results), meta)
 
 
 def generate_action_plan_html(out, results, scores, proposals, meta):
-    _ensure_public_model(results, scores, proposals, lot=str(meta.get("lot", "")), axes_config=meta.get("axes_config"))
+    _ensure_public_model(results, scores, proposals, lot=str(meta.get("lot", "")), axes_config=meta.get("axes_config"), restitution_rules=meta.get("restitution_rules"), messages=meta.get("messages"))
     return _generate_action_plan_html_v6(out, results, scores, _canonical_proposals(results), meta)
 
-# Nettoyage typographique final après expansion des termes techniques.
-_plain_language_v7_base = _plain_language
-
-def _plain_language(value: Any) -> str:
-    text = _plain_language_v7_base(value)
-    replacements = {
-        "plateforme plateforme commune de dépôt (CDE)": "plateforme commune de dépôt (CDE)",
-        "plateformes plateforme commune de dépôt (CDE)": "plateformes communes de dépôt (CDE)",
-        "la plateforme la plateforme commune de dépôt (CDE)": "la plateforme commune de dépôt (CDE)",
-        "(exploitation et maintenance)": "(GMAO / AIM)",
-        "nous confirmeons": "nous confirmons",
-        "outil de outil de gestion de maintenance (GMAO)": "outil de gestion de maintenance (GMAO)",
-        "outil de gestion de maintenance (outil de gestion de maintenance (GMAO))": "outil de gestion de maintenance (GMAO)",
-        "modèle de données outil de gestion de maintenance (GMAO)": "modèle de données GMAO",
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-    return re.sub(r"\\s+", " ", text).strip()
 
 
 def _plain_title(block_id: str, result: Dict[str, Any]) -> str:
-    return _pdf_safe(result.get("public_title") or _clean((result.get("bloc") or {}).get("titre_bloc")) or _FALLBACK_PLAIN_TITLES.get(block_id) or block_id)
+    return _pdf_safe(result.get("public_title") or _clean((result.get("bloc") or {}).get("titre_bloc")) or block_id)
 
 
 def generate_glossary_html(out: Path, meta: Dict[str, Any]) -> None:
-    """3e livrable : glossaire autonome des termes BIM détectés dans les
-    documents analysés, le questionnaire d'auto-évaluation et les textes de
-    l'outil (même liste, déjà filtrée en amont, que les sections glossaire du
-    Dashboard et du Plan d'Actions -- jamais le référentiel complet)."""
+    """Glossaire autonome : definition de reference + explication simple TPE/PME.
+
+    La reference de definition est volontairement separee de l'endroit ou le
+    terme a ete repere dans le DCE. Le glossaire reste contextuel : seuls les
+    termes effectivement detectes dans le corpus sont affiches.
+    """
     if meta.get("logo_data_uri"):
         brand_html = f'<img src="{html.escape(str(meta.get("logo_data_uri")))}" alt="Logo">'
     else:
         brand_html = html.escape(str(meta.get("marque") or meta.get("entreprise") or "Entreprise"))
-    entries = sorted((meta.get("glossary_entries") or []), key=lambda e: str(e.get("term", "")).casefold())
-    rows = "".join(
-        f'<div class="gloss-row"><strong>{html.escape(str(e.get("term","")))}</strong>'
-        f'<span>{html.escape(str(e.get("definition","")))}'
-        + (f'<small>{html.escape(str(e.get("source")))}</small>' if e.get("source") else "")
-        + '</span></div>'
-        for e in entries if e.get("term") and e.get("definition")
-    )
+    identity_items = [item for item in [
+        ("Projet", meta.get("nom_projet")),
+        ("Entreprise", meta.get("entreprise")),
+        ("Lot", meta.get("lot")),
+        ("Documents analysés", meta.get("documents_analyses") or meta.get("documents_resume")),
+        ("Adresse", meta.get("adresse")),
+        ("Email", meta.get("email")),
+        ("Analyse réalisée par", meta.get("analyste")),
+        ("Date", meta.get("date")),
+    ] if item[1]]
+    identity_html = (
+        '<div class="hero-identity">' +
+        "".join(f'<div class="id-line"><span>{html.escape(label)}</span><b>{html.escape(str(value))}</b></div>' for label, value in identity_items) +
+        '</div>'
+    ) if identity_items else ""
+
+    entries = sorted((meta.get("glossary_export_entries") or meta.get("glossary_entries") or []), key=lambda e: str(e.get("term", "")).casefold())
+    rows = []
+    for entry in entries:
+        term = str(entry.get("term", "")).strip()
+        definition = str(entry.get("definition", "")).strip()
+        if not term or not definition:
+            continue
+        practice = str(entry.get("practice", "")).strip()
+        reference = str(entry.get("reference") or "").strip()
+        detected = str(entry.get("detected_in") or entry.get("source") or "").strip()
+        practice_html = f'<div class="practice"><b>En pratique</b>{html.escape(practice)}</div>' if practice else ""
+        meta_bits = []
+        if reference:
+            meta_bits.append(f'<span><strong>Référence :</strong> {html.escape(reference)}</span>')
+        if detected:
+            meta_bits.append(f'<span><strong>Repéré dans le DCE :</strong> {html.escape(detected)}</span>')
+        meta_html = '<div class="entry-meta">' + ''.join(meta_bits) + '</div>' if meta_bits else ''
+        rows.append(
+            f'<article class="gloss-row"><div class="term">{html.escape(term)}</div>'
+            f'<div class="content"><p class="definition">{html.escape(definition)}</p>{practice_html}{meta_html}</div></article>'
+        )
+
     doc = (
         '<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-        f'<title>Glossaire BIM - {html.escape(str(meta.get("lot","")))}</title><style>'
-        ':root{--navy:#0B2733;--magenta:#A1003D;--magenta-light:#9C5B45;--blue:#1F5D8C;--line:#D7E1E6;--muted:#5B7280;--pale2:#EEF3F5;--slate:#33495A}'
+        f'<title>Glossaire BIM - {html.escape(str(meta.get("lot", "")))}</title><style>'
+        ':root{--navy:#0B2733;--magenta:#A1003D;--magenta-light:#9C5B45;--blue:#1F5D8C;--line:#D7E1E6;--muted:#5B7280;--pale:#F1F7FA;--pale2:#F5F8FA;--slate:#33495A}'
         '*{box-sizing:border-box}body{margin:0;background:#f2f5f7;color:#1A2B33;font:14px/1.5 Calibri,Carlito,"Segoe UI",Arial,sans-serif}'
-        '.hero{background:var(--navy);border-bottom:5px solid var(--magenta);padding:27px max(25px,calc((100vw - 1100px)/2));display:flex;align-items:center;gap:22px}'
-        '.brand{font-size:29px;font-weight:800;color:var(--magenta-light);border-right:1px solid rgba(156,91,69,.45);padding-right:22px}'
-        '.brand img{max-height:40px;max-width:160px;display:block;object-fit:contain}'
-        '.hero h1{margin:0;color:var(--magenta-light);font-size:29px;line-height:1;font-weight:700}'
-        '.hero p{margin:7px 0 0;color:#E7D3CB;font-weight:600}'
-        '.container{max-width:1100px;margin:0 auto;padding:22px}'
-        '.count-bar{background:#fff;border:1px solid var(--line);border-radius:6px;padding:12px 16px;margin-bottom:14px;color:var(--muted);font-weight:700}'
-        '.count-bar b{color:var(--navy)}'
-        '#search{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:6px;margin-bottom:14px;font:inherit}'
-        '.gloss-table{border:1px solid var(--line);border-radius:6px;overflow:hidden;background:#fff}'
-        '.gloss-row{display:grid;grid-template-columns:200px 1fr;border-bottom:1px solid var(--line)}'
-        '.gloss-row:last-child{border-bottom:0}'
-        '.gloss-row strong{padding:12px;background:var(--pale2);color:var(--blue);font-size:13px}'
-        '.gloss-row span{padding:12px;font-size:13px;color:var(--slate)}'
-        '.gloss-row small{display:block;margin-top:5px;color:var(--muted);font-style:italic}'
-        '@media(max-width:700px){.gloss-row{grid-template-columns:1fr}.gloss-row strong{border-bottom:1px solid var(--line)}}'
+        '.hero{background:var(--navy);border-bottom:5px solid var(--magenta);padding:27px max(25px,calc((100vw - 1160px)/2));display:flex;align-items:flex-start;gap:22px}'
+        '.brand{font-size:29px;font-weight:800;color:var(--magenta-light);border-right:1px solid rgba(156,91,69,.45);padding-right:22px}.brand img{max-height:40px;max-width:160px;display:block;object-fit:contain}'
+        '.hero h1{margin:0;color:var(--magenta-light);font-size:29px;line-height:1.06;font-weight:700}.hero p{margin:7px 0 0;color:#E7D3CB;font-weight:600}'
+        '.hero-identity{margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,.14);display:flex;flex-direction:column;gap:5px;max-width:820px}.id-line{display:flex;gap:10px;font-size:12px;color:#F5C8D8;line-height:1.3}.id-line span{flex:0 0 150px;color:#8FA3AC;text-transform:uppercase;font-size:9.5px;font-weight:700;letter-spacing:.03em;padding-top:2px}.id-line b{font-weight:600}'
+        '.container{max-width:1160px;margin:0 auto;padding:22px}.count-bar{background:#fff;border:1px solid var(--line);border-radius:6px;padding:11px 14px;margin-bottom:12px;color:var(--muted);font-weight:700}.count-bar b{color:var(--navy);font-size:18px}'
+        '#search{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:6px;margin-bottom:14px;font:inherit;background:#fff}'
+        '.gloss-table{border:1px solid var(--line);border-radius:6px;overflow:hidden;background:#fff}.gloss-row{display:grid;grid-template-columns:205px 1fr;border-bottom:1px solid var(--line);break-inside:avoid}.gloss-row[hidden]{display:none!important}.gloss-row:last-child{border-bottom:0}'
+        '.term{padding:15px 13px;background:var(--pale2);color:var(--magenta);font-size:14px;font-weight:800}.content{padding:13px 15px}.definition{font-size:13px;color:var(--slate);margin:0 0 9px}'
+        '.practice{background:var(--pale);border-left:3px solid var(--blue);padding:8px 10px;margin:0 0 8px;color:#244657}.practice b{display:block;color:var(--blue);font-size:9.5px;letter-spacing:.04em;text-transform:uppercase;margin-bottom:2px}'
+        '.entry-meta{display:flex;flex-wrap:wrap;gap:4px 18px;font-size:10.5px;color:var(--muted);line-height:1.45}.entry-meta strong{color:#455D6B;font-weight:700}'
+        '@media(max-width:700px){.hero{flex-wrap:wrap}.brand{border-right:0;border-bottom:1px solid rgba(156,91,69,.45);padding:0 0 8px;width:100%}.gloss-row{grid-template-columns:1fr}.term{border-bottom:1px solid var(--line)}.id-line{display:block}.id-line span{display:block;margin-bottom:2px}}'
         '</style></head><body>'
-        f'<header class="hero"><div class="brand">{brand_html}</div><div><h1>GLOSSAIRE DES TERMES BIM</h1>'
-        f'<p>{html.escape(str(meta.get("entreprise","-")))} - Lot {html.escape(str(meta.get("lot","-")))} - Termes détectés dans les documents, le questionnaire et l\'outil</p></div></header>'
-        f'<div class="container"><div class="count-bar"><b>{len(entries)}</b> terme(s) technique(s) BIM détecté(s) pour ce dossier.</div>'
-        '<input id="search" placeholder="Rechercher un terme ou une définition…">'
-        f'<div class="gloss-table" id="glossTable">{rows}</div></div>'
-        '<script>document.getElementById("search").addEventListener("input",e=>{const q=e.target.value.toLowerCase();'
-        'document.querySelectorAll("#glossTable .gloss-row").forEach(r=>{r.hidden=!r.innerText.toLowerCase().includes(q);});});</script>'
+        f'<header class="hero"><div class="brand">{brand_html}</div><div><h1>GLOSSAIRE DES TERMES BIM</h1><p>Définitions de référence et explications simples pour les TPE/PME</p>{identity_html}</div></header>'
+        f'<main class="container"><div class="count-bar"><b>{len(rows)}</b> terme(s) technique(s) BIM détecté(s) pour ce dossier.</div>'
+        '<input id="search" aria-label="Rechercher dans le glossaire" placeholder="Rechercher un terme, une définition ou une explication...">'
+        f'<section class="gloss-table" id="glossTable">{"".join(rows)}</section></main>'
+        '<script>const search=document.getElementById("search");const rows=[...document.querySelectorAll("#glossTable .gloss-row")];'
+        'const norm=v=>(v||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase().trim();'
+        'const applyGlossaryFilter=()=>{const q=norm(search.value);rows.forEach(r=>{r.hidden=q!==""&&!norm(r.textContent).includes(q)})};'
+        '["input","change","search"].forEach(evt=>search.addEventListener(evt,applyGlossaryFilter));window.addEventListener("pageshow",applyGlossaryFilter);applyGlossaryFilter();</script>'
         '</body></html>'
     )
     Path(out).write_text(doc, encoding="utf-8")
 
 
 def generate_glossary_pdf(out: Path, meta: Dict[str, Any]) -> None:
-    """Version PDF du glossaire autonome (même contenu que generate_glossary_html)."""
-    entries = sorted((meta.get("glossary_entries") or []), key=lambda e: str(e.get("term", "")).casefold())
+    """PDF du glossaire : charte historique conservee, contenu pedagogique enrichi."""
+    entries = sorted((meta.get("glossary_export_entries") or meta.get("glossary_entries") or []), key=lambda e: str(e.get("term", "")).casefold())
     doc = _v4_doc(
         out, "Glossaire des termes BIM détectés dans ce dossier", pagesize=A4, landscape_mode=False,
         marque=meta.get("marque") or meta.get("entreprise") or "Entreprise",
-        logo_bytes=meta.get("logo_bytes"),
+        logo_bytes=meta.get("logo_bytes"), top_margin_mm=14,
     )
     story: List[Any] = [
         _para("GLOSSAIRE DES TERMES BIM", V4["h1"]),
-        _para(
-            f'{_esc(str(meta.get("entreprise","-")))} - Lot {_esc(str(meta.get("lot","-")))} - '
-            f'{len(entries)} terme(s) détecté(s) dans les documents, le questionnaire et l\'outil.',
-            V4["small"],
-        ),
-        Spacer(1, 8),
+        _para(f'{len(entries)} terme(s) détecté(s) dans les documents analysés.', V4["small"]),
+        Spacer(1, 4),
     ]
-    _gloss_term_style = ParagraphStyle("gloss_term_std", parent=V4["table"], fontName=FONT_BOLD, fontSize=8.2, leading=10.2, textColor=V4_MAGENTA)
-    _gloss_def_style = ParagraphStyle("gloss_def_std", parent=V4["table"], fontSize=8.2, leading=10.4)
+    identity_items = [item for item in [
+        ("Projet", meta.get("nom_projet")),
+        ("Entreprise", meta.get("entreprise")),
+        ("Lot", meta.get("lot")),
+        ("Documents analysés", meta.get("documents_analyses") or meta.get("documents_resume")),
+        ("Adresse", meta.get("adresse")),
+        ("Email", meta.get("email")),
+        ("Analyse réalisée par", meta.get("analyste")),
+        ("Date", meta.get("date")),
+    ] if item[1]]
+    if identity_items:
+        label_style = ParagraphStyle("id_label_gloss48", parent=V4["small"], fontName=FONT_BOLD, textColor=V4_MAGENTA, fontSize=7, leading=11)
+        value_style = ParagraphStyle("id_value_gloss48", parent=V4["small"], textColor=V4_NAVY, fontSize=8.3, leading=11)
+        table = Table(
+            [[_rich_para(_esc(label.upper()), label_style), _rich_para(_esc(str(value)), value_style)] for label, value in identity_items],
+            colWidths=[38*mm, 130*mm],
+        )
+        table.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 1.3), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.3),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ]))
+        table.hAlign = "LEFT"
+        story.append(table)
+    story.append(Spacer(1, 7))
+
+    term_style = ParagraphStyle("gloss_term48", parent=V4["table"], fontName=FONT_BOLD, fontSize=8.4, leading=10.4, textColor=V4_MAGENTA, spaceAfter=2)
+    def_style = ParagraphStyle("gloss_def48", parent=V4["table"], fontSize=8.2, leading=10.4, textColor=V4_TEXT, spaceAfter=3)
+    practice_label = ParagraphStyle("gloss_practice_label48", parent=V4["tiny"], fontName=FONT_BOLD, textColor=V4_BLUE, fontSize=6.6, leading=8)
+    practice_text = ParagraphStyle("gloss_practice_text48", parent=V4["table"], textColor=V4_SLATE, fontSize=7.7, leading=9.8)
+    meta_style = ParagraphStyle("gloss_meta48", parent=V4["tiny"], textColor=V4_MUTED, fontSize=6.6, leading=8.4)
+
     for entry in entries:
-        term = str(entry.get("term", ""))
-        definition = str(entry.get("definition", ""))
+        term = str(entry.get("term", "")).strip()
+        definition = str(entry.get("definition", "")).strip()
         if not term or not definition:
             continue
-        story.append(_rich_para(_esc(term), _gloss_term_style))
-        story.append(_rich_para(_esc(definition), _gloss_def_style))
-        story.append(Spacer(1, 4))
+        practice = str(entry.get("practice", "")).strip()
+        reference = str(entry.get("reference") or "").strip()
+        detected = str(entry.get("detected_in") or entry.get("source") or "").strip()
+        block: List[Any] = [_rich_para(_esc(term), term_style), _rich_para(_esc(definition), def_style)]
+        if practice:
+            practice_cell = [
+                _rich_para("EN PRATIQUE", practice_label),
+                _rich_para(_esc(practice), practice_text),
+            ]
+            practice_table = Table([[practice_cell]], colWidths=[166*mm])
+            practice_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F1F7FA")),
+                ("LINEBEFORE", (0, 0), (0, -1), 2, V4_BLUE),
+                ("LEFTPADDING", (0, 0), (-1, -1), 7), ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+                ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ]))
+            block.append(practice_table)
+            block.append(Spacer(1, 2))
+        meta_parts = []
+        if reference:
+            meta_parts.append(f'<b>Référence :</b> {_esc(reference)}')
+        if detected:
+            meta_parts.append(f'<b>Repéré dans le DCE :</b> {_esc(detected)}')
+        if meta_parts:
+            block.append(_rich_para(" &nbsp;&nbsp; ".join(meta_parts), meta_style))
+        block.append(Spacer(1, 5))
+        story.append(KeepTogether(block))
     doc.build(story)
-

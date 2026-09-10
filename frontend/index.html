@@ -21,12 +21,17 @@
           <label class="field">
             <span><span class="static-term" data-term="Convention BIM">Convention BIM</span> <b>*</b></span>
             <input type="file" name="convention" accept="application/pdf,.pdf" required>
-            <small id="convention-file-status">PDF obligatoire</small>
+            <div class="file-status-row"><small id="convention-file-status">PDF obligatoire</small><button class="file-clear-button" type="button" data-clear-file="convention" disabled aria-disabled="true">Décharger</button></div>
           </label>
           <label class="field">
             <span><span class="static-term" data-term="CCTP">CCTP du lot</span></span>
             <input type="file" name="cctp" accept="application/pdf,.pdf">
-            <small id="cctp-file-status">PDF facultatif, mais recommandé</small>
+            <div class="file-status-row"><small id="cctp-file-status">PDF facultatif, mais recommandé</small><button class="file-clear-button" type="button" data-clear-file="cctp" disabled aria-disabled="true">Décharger</button></div>
+          </label>
+          <label class="field">
+            <span>CCAP</span>
+            <input type="file" name="ccap" accept="application/pdf,.pdf">
+            <div class="file-status-row"><small id="ccap-file-status">PDF facultatif — utilisé pour le repérage de l’ordre de priorité des pièces lorsqu’il est explicitement indiqué</small><button class="file-clear-button" type="button" data-clear-file="ccap" disabled aria-disabled="true">Décharger</button></div>
           </label>
           <label class="field">
             <span>Entreprise</span>
@@ -50,6 +55,10 @@
             <span><strong>Test rapide sans auto-évaluation</strong><small>Utile pour vérifier d'abord la lecture des PDF et la génération du dashboard.</small></span>
           </label>
         </div>
+        <div id="live-precheck" class="live-precheck pending" aria-live="polite">
+          <div><strong>Contrôle préalable du dossier</strong><span id="live-precheck-text">À vérifier avant analyse : type des pièces, projet, lot et cohérence entre documents.</span></div>
+          <button id="precheck-button" class="secondary-button" type="button">Vérifier le dossier</button>
+        </div>
       </section>
 
       <section class="panel" id="questionnaire-panel">
@@ -66,6 +75,7 @@
         </div>
         <div class="submit-actions">
           <button id="clear-memory-button" class="secondary-button" type="button">Effacer les données mémorisées</button>
+          <button id="autoeval-button" class="secondary-button" type="button">Auto-évaluation seule</button>
           <button id="submit-button" type="submit">Analyser les documents</button>
         </div>
       </section>

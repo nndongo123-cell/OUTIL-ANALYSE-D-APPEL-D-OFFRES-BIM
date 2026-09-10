@@ -20,27 +20,14 @@ Usage :
     --out         Rapport_BIM_V1.pdf
 """
 from __future__ import annotations
-import argparse, base64, html, io, json, re, sys, textwrap, unicodedata
+import argparse, base64, html, json, re, sys, textwrap, unicodedata, time
+from functools import lru_cache
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import fitz
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-import numpy as np
-
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import cm
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-    PageBreak, Image, HRFlowable, KeepTogether
-)
 from datetime import datetime
 import base64
 try:
@@ -49,8 +36,9 @@ try:
 except ImportError:
     _HAS_DASHBOARD = False
 
-from bim_model import block_sort_key, ensure_public_model
+from bim_model import block_sort_key, ensure_public_model, capacity_code_for_pct
 from content_rules import glossary_entries_from_dataframe, normalize_questions_dataframe
+from autoeval_report import generate_autoevaluation_reports
 
 from reporting_v2 import (
     generate_action_plan_html,
@@ -62,25 +50,7 @@ from reporting_v2 import (
 # ═══════════════════════════════════════════════════════════════════════════════
 # PALETTE
 # ═══════════════════════════════════════════════════════════════════════════════
-C_BLUE    = colors.HexColor("#1F4E78")
-C_BLUE_L  = colors.HexColor("#D9EAF7")
-C_RED_L   = colors.HexColor("#FCE4D6")
-C_RED_DK  = colors.HexColor("#7D0000")
-C_ORA_L   = colors.HexColor("#FFF2CC")
-C_ORA_DK  = colors.HexColor("#7D4E00")
-C_GRN_L   = colors.HexColor("#E2EFDA")
-C_GRN_DK  = colors.HexColor("#276221")
-C_GRY_L   = colors.HexColor("#F3F6FA")
-C_GRY_MID = colors.HexColor("#555555")
-C_WHITE   = colors.white
 
-STATUT_META = {
-    "CONFIRMÉE":     (C_RED_L,  C_RED_DK,  "CONFIRMÉE"),
-    "PROBABLE":      (C_ORA_L,  C_ORA_DK,  "PROBABLE"),
-    "PARTIELLE":     (C_ORA_L,  C_ORA_DK,  "PARTIELLE"),
-    "NON DÉMONTRÉE": (C_GRN_L,  C_GRN_DK,  "NON DÉMONTRÉE"),
-    "NON APPLICABLE":(C_GRY_L,  C_GRY_MID, "NON APPLICABLE"),
-}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UTILITAIRES TEXTE
@@ -89,10 +59,32 @@ def clean(s: object) -> str:
     return re.sub(r"\s+", " ",
                   html.unescape(str(s or "")).replace("\xa0", " ")).strip()
 
-def norm(s: object) -> str:
-    n = "".join(c for c in unicodedata.normalize("NFD", clean(s))
+@lru_cache(maxsize=16384)
+def _norm_cached_string(raw: str) -> str:
+    """Normalisation Unicode mise en cache.
+
+    Les mêmes textes de Convention/CCTP et les mêmes segments sont interrogés
+    de très nombreuses fois pendant l'analyse. Le cache évite de refaire à
+    chaque mot-clé le nettoyage et la décomposition Unicode du document entier.
+    Cette optimisation ne modifie aucune règle métier ni aucun seuil.
+    """
+    cleaned = re.sub(r"\s+", " ", html.unescape(raw).replace("\xa0", " ")).strip()
+    # Canonicalisation typographique générale avant toute comparaison métier.
+    # Les PDF mélangent fréquemment apostrophes/dashes Unicode et ASCII ; ces
+    # variantes ne doivent jamais nécessiter une règle propre à un DCE.
+    translation = str.maketrans({
+        "’": "'", "‘": "'", "´": "'", "`": "'", "ʼ": "'",
+        "‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-", "−": "-",
+        "œ": "oe", "Œ": "OE",
+    })
+    cleaned = cleaned.translate(translation)
+    n = "".join(c for c in unicodedata.normalize("NFD", cleaned)
                 if unicodedata.category(c) != "Mn")
     return re.sub(r"\s+", " ", n.lower()).strip()
+
+def norm(s: object) -> str:
+    raw = s if isinstance(s, str) else str(s or "")
+    return _norm_cached_string(raw)
 
 def split_kw(s: object) -> List[str]:
     return [clean(x) for x in re.split(r"[;|,]", str(s or "")) if clean(x)]
@@ -100,7 +92,8 @@ def split_kw(s: object) -> List[str]:
 def contains(text: str, kw: str) -> bool:
     t, m = norm(text), norm(kw)
     if not m: return False
-    if len(m) <= 4:
+    short_max = p_int(ENGINE_PARAMS_GLOBAL, "texte_mot_court_longueur_max", 0)
+    if short_max and len(m) <= short_max:
         return re.search(r"(?<![a-z0-9])" + re.escape(m) + r"(?![a-z0-9])", t) is not None
     return m in t
 
@@ -117,7 +110,8 @@ def trouve_position(text_lower: str, kw: str, depart: int = 0) -> int:
     kw_low = kw.lower()
     if not kw_low:
         return -1
-    if len(kw_low) <= 4:
+    short_max = p_int(ENGINE_PARAMS_GLOBAL, "texte_mot_court_longueur_max", 0)
+    if short_max and len(kw_low) <= short_max:
         m = re.search(r"(?<![a-zà-ÿ0-9])" + re.escape(kw_low) + r"(?![a-zà-ÿ0-9])", text_lower[depart:])
         return (m.start() + depart) if m else -1
     return text_lower.find(kw_low, depart)
@@ -126,105 +120,168 @@ def any_kw(text: str, kws: List[str]) -> bool:
     return any(contains(text, k) for k in kws)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FILTRES BIM
+# FILTRES TEXTUELS PARAMÉTRÉS
 # ═══════════════════════════════════════════════════════════════════════════════
-# Motifs administratifs GÉNÉRIQUES (regex, aucun nom de projet/adresse en dur).
-# Sert à repérer des lignes d'en-tête typiques indépendamment du projet analysé.
-ADMIN_PATTERNS = [
-    r"\bsiret\b", r"\bnaf\s", r"tva intracommunautaire", r"\S+@\S+\.\S+",
-    r"sarl au capital", r"ordre national des architectes",
-    r"\bpage\s+\d+\s+sur\s+\d+",
-    r"\b0[1-9](?:[\s.]\d{2}){4}\b",           # téléphone FR
-    r"\b\d{1,4}\s+(?:rue|avenue|boulevard|impasse|allée)\s",  # adresse
-]
+# Les motifs métier sont chargés depuis 15_Filtres_Texte. Les listes ci-dessous
+# restent vides tant que le classeur de paramétrage n'a pas été chargé.
+TEXT_FILTERS: Dict[str, List[Tuple[str, str]]] = {}
+ENGINE_PARAMS_GLOBAL: Dict[str, object] = {}
+
+def configure_text_filters(filters_df: pd.DataFrame, params: Dict[str, object]) -> None:
+    global TEXT_FILTERS, ENGINE_PARAMS_GLOBAL
+    ENGINE_PARAMS_GLOBAL = dict(params or {})
+    out: Dict[str, List[Tuple[str, str]]] = {}
+    if filters_df is not None and not filters_df.empty:
+        for _, row in filters_df.iterrows():
+            if clean(row.get("actif", "Oui")).casefold() in {"non", "false", "0"}:
+                continue
+            typ = clean(row.get("type_filtre", ""))
+            motif = str(row.get("motif", "") or "").strip()
+            mode = clean(row.get("mode", "contient")).lower()
+            if typ and motif:
+                out.setdefault(typ, []).append((motif, mode))
+    TEXT_FILTERS = out
+
+def _filter_match(text: str, motif: str, mode: str) -> bool:
+    if mode == "regex":
+        try:
+            return re.search(motif, text, flags=re.IGNORECASE) is not None
+        except re.error:
+            return False
+    return contains(text, motif)
+
+def _matches_filter_type(text: str, type_filtre: str) -> bool:
+    return any(_filter_match(text, motif, mode) for motif, mode in TEXT_FILTERS.get(type_filtre, []))
+
+def _iter_keyword_occurrences(text_norm: str, keyword_norm: str):
+    """Retourne les occurrences d'un mot-clé dans un texte normalisé.
+
+    Le moteur reste générique : les mots courts utilisent les mêmes limites de
+    mot que le reste de l'analyse, afin d'éviter par exemple qu'un acronyme soit
+    trouvé à l'intérieur d'un autre mot.
+    """
+    if not keyword_norm:
+        return []
+    short_max = p_int(ENGINE_PARAMS_GLOBAL, "texte_mot_court_longueur_max", 0)
+    if short_max and len(keyword_norm) <= short_max:
+        pat = re.compile(r"(?<![a-z0-9])" + re.escape(keyword_norm) + r"(?![a-z0-9])")
+        return [(m.start(), m.end()) for m in pat.finditer(text_norm)]
+    out = []
+    start = 0
+    while True:
+        pos = text_norm.find(keyword_norm, start)
+        if pos < 0:
+            break
+        out.append((pos, pos + len(keyword_norm)))
+        start = pos + max(1, len(keyword_norm))
+    return out
+
+def _clause_span(text_norm: str, start: int, end: int) -> Tuple[int, int]:
+    """Borne l'analyse de négation à la proposition/phrase locale.
+
+    Les motifs de négation eux-mêmes restent entièrement paramétrés dans
+    15_Filtres_Texte (type NEGATION_TEMPLATE). Le code ne connaît ni bloc, ni
+    métier, ni formulation contractuelle particulière.
+    """
+    separators = ".;!?"
+    left = 0
+    for sep in separators:
+        pos = text_norm.rfind(sep, 0, start)
+        if pos >= left:
+            left = pos + 1
+    right_candidates = []
+    for sep in separators:
+        pos = text_norm.find(sep, end)
+        if pos >= 0:
+            right_candidates.append(pos)
+    right = min(right_candidates) if right_candidates else len(text_norm)
+    return left, right
+
+def _occurrence_is_locally_negated(text_norm: str, keyword_norm: str, start: int, end: int) -> bool:
+    """Teste si une occurrence est niée par une règle générique Excel.
+
+    Chaque motif NEGATION_TEMPLATE contient le jeton {term}; le moteur le
+    remplace par le mot-clé effectivement recherché. La négation est ainsi
+    rattachée à l'occurrence qu'elle vise, sans coder de bloc, de métier ou de
+    livrable particulier dans Python.
+    """
+    templates = TEXT_FILTERS.get("NEGATION_TEMPLATE", [])
+    if not templates:
+        return False
+    left, right = _clause_span(text_norm, start, end)
+    fragment = text_norm[left:right]
+    rel_start = start - left
+    escaped_term = re.escape(keyword_norm)
+    for motif, mode in templates:
+        pattern = str(motif or "").replace("{term}", escaped_term)
+        if not pattern:
+            continue
+        if mode == "regex":
+            try:
+                for match in re.finditer(pattern, fragment, flags=re.IGNORECASE):
+                    # Le motif doit couvrir l'occurrence précise du terme ; une
+                    # négation visant un autre objet de la même phrase n'est donc
+                    # pas suffisante pour annuler cette preuve.
+                    if match.start() <= rel_start < match.end():
+                        return True
+            except re.error:
+                continue
+        else:
+            # Mode contient conservé pour extensibilité du paramétrage, même si
+            # les modèles de négation actuels sont des regex.
+            literal = norm(pattern)
+            if literal and literal in fragment:
+                idx = fragment.find(literal)
+                if idx <= rel_start < idx + len(literal):
+                    return True
+    return False
+
+def keyword_has_non_negated_occurrence(text: str, keyword: str) -> bool:
+    """Vrai si au moins une occurrence du mot-clé n'est pas niée localement."""
+    t = norm(text)
+    k = norm(keyword)
+    if not t or not k:
+        return False
+    occurrences = _iter_keyword_occurrences(t, k)
+    if not occurrences:
+        return False
+    return any(not _occurrence_is_locally_negated(t, k, start, end)
+               for start, end in occurrences)
+
+def any_kw_non_negated(text: str, kws: List[str]) -> bool:
+    """Équivalent d'any_kw pour les signaux positifs contractuels."""
+    return any(keyword_has_non_negated_occurrence(text, k) for k in kws if k)
 
 def _matches_admin_pattern(line: str) -> bool:
-    n = line.lower()
-    return any(re.search(p, n) for p in ADMIN_PATTERNS)
+    return _matches_filter_type(line, "ADMIN_REGEX")
 
-def detect_running_headers(pages_raw: List[str], min_ratio: float = 0.3) -> set:
-    """
-    Détecte automatiquement les lignes qui se répètent sur plusieurs pages
-    d'un même document (en-têtes/pieds de page, nom de projet répété,
-    adresse d'agence en pied de page...). Générique : fonctionne sur
-    n'importe quelle convention/CCTP, sans aucun texte de projet codé en dur.
-    """
+def detect_running_headers(pages_raw: List[str]) -> set:
     from collections import Counter
     n_pages = len(pages_raw)
-    if n_pages < 3:
+    min_pages = p_int(ENGINE_PARAMS_GLOBAL, "entete_repetee_pages_min", 0)
+    if min_pages and n_pages < min_pages:
         return set()
+    line_min = p_int(ENGINE_PARAMS_GLOBAL, "entete_repetee_ligne_longueur_min", 0)
+    line_max = p_int(ENGINE_PARAMS_GLOBAL, "entete_repetee_ligne_longueur_max", 10**9)
+    min_ratio = p_float(ENGINE_PARAMS_GLOBAL, "entete_repetee_ratio_min", 0.0)
+    min_occ = p_int(ENGINE_PARAMS_GLOBAL, "entete_repetee_occurrences_min", 0)
     counts = Counter()
     for txt in pages_raw:
         seen = set()
-        for l in txt.split("\n"):
-            l = l.strip().lower()
-            if 8 <= len(l) <= 120:
-                seen.add(l)
-        for l in seen:
-            counts[l] += 1
-    threshold = max(3, int(n_pages * min_ratio))
-    return {l for l, c in counts.items() if c >= threshold}
-
-HORS_BIM = [
-    "fsc", "pefc", "fdes", "acermi", "cov etiquette", "biosource", "biosourcé",
-    "gestion des dechets", "gestion des déchets", "soged", "chantier vert",
-    "bon de livraison", "label e+c", "e+c-", "siret", "tva intracommunautaire",
-    "contact@", "naf ", "sarl au capital", "ordre national des architectes",
-    "plan de gestion des dechets", "valorisation dechet",
-    # Légendes d'images et titres de schémas dans les CCTP
-    "exemple de données réinjectées", "exemple de donnees reinjectees",
-    "synthèse du processus de renseignement",
-    "synthese du processus de renseignement",
-    "exemple de nomenclature excel renseignée",
-    "exemple de nomenclature excel renseignee",
-    # Titres de chapitres et sections
-    "description des ouvrages",
-    "prototype", "echafaudages et protections",
-    "bardage bois", "bardage en polycarbonate",
-    "obligations administratives", "responsabilite de l",
-    "contenu des prix", "caractere global et forfaitaire",
-    "generalites", "consistance des travaux",
-    "documents et materiaux a soumettre", "dessins d execution",
-    "contraintes concernant le site", "etude d execution",
-    "performances acoustiques", "essais", "tolerances",
-    "travaux a la charge des autres", "mesures obligatoires portant",
-    "les mesures obligatoires portant",
-    # Sections réglementaires et administratives du CCTP (hors BIM)
-    "prescriptions environnementales", "nature de la reglementation",
-    "liaisons entre les corps d", "contenu des prix",
-    "demarches et autorisations", "responsabilite de l entrepreneur",
-    "obligations administratives", "normes", "avis techniques",
-    "regles de securite", "protections", "moyens de levage",
-    "autocontrole", "provenance et agrement", "variantes exigees",
-    "repliement du lot", "ouvrages complementaires",
-    # Sommaires et tables des matières (pointillés)
-    "............", "...........",
-    # Annexes de codification (pas des règles contractuelles)
-    "codification des plans generaux dans l arborescence",
-    "codification des plans techniques par lot",
-    "codification et organisation des vues",
-    "codification des modelisation",
-]
-
-BIM_SIGNAL = [
-    "maquette", "ifc", "bim", "rvt", "revit", "cde", "ged", "kroqi",
-    "bim manager", "doe numerique", "doe numérique", "natif", "parametre",
-    "paramètre", "nomenclature", "livrable bim", "convention bim",
-    "charte bim", "loin", "lod", "point de base", "georeferencement",
-    "géoréférencement", "gabarit", "plateforme collaborative", "data drop",
-    "as-built", "aim", "gmao", "bep", "format natif", "export ifc",
-    "coordination bim", "clash", "revue maquette", "tableau excel",
-    "renseignement de la maquette", "processus bim", "maquette numerique",
-    "maquette numérique", "doe numerique bim", "cahier des charges bim",
-    "proprietes demandees", "propriétés demandées",
-]
+        for line in txt.split("\n"):
+            line = line.strip().lower()
+            if line_min <= len(line) <= line_max:
+                seen.add(line)
+        for line in seen:
+            counts[line] += 1
+    threshold = max(min_occ, int(n_pages * min_ratio))
+    return {line for line, count in counts.items() if count >= threshold}
 
 def is_hors_bim(txt: str) -> bool:
-    n = norm(txt)
-    return any(h in n for h in HORS_BIM)
+    return _matches_filter_type(txt, "HORS_BIM")
 
 def has_bim_signal(txt: str) -> bool:
-    return any(contains(txt, b) for b in BIM_SIGNAL)
+    return _matches_filter_type(txt, "BIM_SIGNAL")
 
 def clean_page_headers(txt: str, running_headers: set = frozenset()) -> str:
     lines = txt.split('\n')
@@ -235,14 +292,8 @@ def clean_page_headers(txt: str, running_headers: set = frozenset()) -> str:
     )
 
 def clean_proof_text(txt: str) -> str:
-    txt = txt.strip()
-    txt = re.sub(r"^\d+\s+rue\s+[A-Za-zéèê]+\s+\d{5}\s+[A-Za-zéè\-]+\s*", "", txt).strip()
-    txt = re.sub(r"^[a-z]\.\s+", "", txt).strip()
-    # Supprimer en-tête de page CCTP (toutes variantes)
-    txt = re.sub(
-        r"DCE[\s\S]{0,400}?\d{2}/\d{2}/\d{4}\s*",
-        "", txt, count=1, flags=re.IGNORECASE).strip()
-    return txt
+    # Nettoyage générique : suppression des lignes reconnues comme administratives.
+    return clean_page_headers(txt).strip()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CHARGEMENT PARAMÉTRAGE
@@ -258,88 +309,49 @@ def read_sheet(path: Path, sheet: str, key_col: str) -> pd.DataFrame:
     headers = [clean(v) for v in raw.iloc[hi].values]
     df = raw.iloc[hi + 1:].copy()
     df.columns = headers
-    df = df.dropna(how="all").fillna("")
+    df = df.dropna(how="all")
+    df = df.astype(object).where(pd.notna(df), "")
     df = df[[c for c in df.columns if c and c.lower() != "nan"]]
     if "actif" in df.columns:
         df = df[df["actif"].astype(str).str.strip().str.lower().ne("non")]
     return df
 
 
-# =============================================================================
-# LECTURE FEUILLE 70_ENTREPRISE
-# =============================================================================
-def load_entreprise(path: Path) -> Dict:
-    """Lit la feuille 70_Entreprise et retourne un dict clé/valeur."""
-    try:
-        import openpyxl as _ox
-        wb = _ox.load_workbook(str(path), data_only=True)
-        if "70_Entreprise" not in wb.sheetnames:
-            return {}
-        ws = wb["70_Entreprise"]
-        data = {}
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if row[0] and not str(row[0]).startswith("#"):
-                # Lire colonne B (index 1) en priorité, sinon colonne C (index 2)
-                val = row[1] if (row[1] is not None and str(row[1]).strip()) \
-                      else (row[2] if len(row) > 2 and row[2] is not None else None)
-                data[str(row[0]).strip()] = str(val).strip() if val is not None else ""
-        return data
-    except Exception:
-        return {}
-
-def get_lots_entreprise(ent: Dict) -> List[str]:
-    """Retourne la liste des lots renseignés (lot_1 à lot_5)."""
-    lots = []
-    for k in ["lot_1","lot_2","lot_3","lot_4","lot_5"]:
-        v = ent.get(k,"").strip()
-        if v:
-            lots.append(v)
-    return lots
-
-def ecrire_historique(path: Path, convention: str, lot: str, score: int):
-    """Écrit l'analyse dans la section E de 70_Entreprise."""
-    try:
-        import openpyxl as _ox
-        from datetime import datetime as _dt
-        wb = _ox.load_workbook(str(path))
-        if "70_Entreprise" not in wb.sheetnames:
-            return
-        ws = wb["70_Entreprise"]
-        # Trouver les cellules ao_X_convention vides
-        for i in range(1, 6):
-            for row in ws.iter_rows():
-                if row[0].value == f"ao_{i}_convention" and not row[1].value:
-                    row[1].value = convention
-                    # Trouver les lignes suivantes
-                    for row2 in ws.iter_rows():
-                        if row2[0].value == f"ao_{i}_lot":    row2[1].value = lot
-                        if row2[0].value == f"ao_{i}_date":   row2[1].value = _dt.now().strftime("%d/%m/%Y")
-                        if row2[0].value == f"ao_{i}_score":  row2[1].value = str(score)
-                    wb.save(str(path))
-                    return
-    except Exception:
-        pass
-
 def load_all(path: Path):
-    blocs    = read_sheet(path, "10_Blocs",       "id_bloc")
-    gloss    = read_sheet(path, "40_Glossaire",   "terme")
-    questions= read_sheet(path, "50_Questions",   "id_bloc")
-    textes   = read_sheet(path, "60_Reponses",    "id_bloc")
+    blocs = read_sheet(path, "10_Blocs", "id_bloc")
+    gloss = read_sheet(path, "40_Glossaire", "terme")
+    questions = read_sheet(path, "50_Questions", "id_bloc")
+    textes = read_sheet(path, "60_Reponses", "id_bloc")
+
     def _try(sheet, key):
         try:
             return read_sheet(path, sheet, key)
         except SystemExit:
             return pd.DataFrame()
-    signaux       = _try("30_CCTP_Signaux", "categorie")
-    detections    = _try("35_Detections_Convention", "cle_ctx")
-    metadata_rules= _try("36_Extraction_Metadata", "champ")
-    axes_config   = _try("16_Axes_Config", "axe")
-    coherence     = _try("55_Regles_Coherence", "id_regle")
-    messages_df   = _try("12_Messages_Moteur", "cle")
-    params_df     = _try("05_Parametres_Moteur", "cle")
-    return (blocs, gloss, questions, textes, signaux, detections,
-            metadata_rules, axes_config, coherence, messages_df, params_df)
 
+    signaux = _try("30_CCTP_Signaux", "categorie")
+    detections = _try("35_Detections_Convention", "cle_ctx")
+    metadata_rules = _try("36_Extraction_Metadata", "champ")
+    axes_config = _try("16_Axes_Config", "axe")
+    coherence = _try("55_Regles_Coherence", "id_regle")
+    messages_df = _try("12_Messages_Moteur", "cle")
+    params_df = _try("05_Parametres_Moteur", "cle")
+    text_filters = _try("15_Filtres_Texte", "id_filtre")
+    restitution_rules = _try("17_Regles_Restitution", "id_regle")
+    ccap_rules = _try("37_CCAP_Reperage", "id_regle")
+    interblock_rules = _try("18_Regles_Interblocs", "id_regle")
+    document_rules = _try("19_Regles_Documentaires", "id_regle")
+    return (
+        blocs, gloss, questions, textes, signaux, detections, metadata_rules,
+        axes_config, coherence, messages_df, params_df, text_filters,
+        restitution_rules, ccap_rules, interblock_rules, document_rules,
+    )
+
+
+def load_rule_rows(df: pd.DataFrame) -> List[Dict[str, object]]:
+    if df is None or df.empty:
+        return []
+    return [{clean(k): row.get(k, "") for k in df.columns if clean(k)} for _, row in df.iterrows()]
 
 def load_params(params_df: pd.DataFrame) -> Dict[str, object]:
     """
@@ -358,6 +370,9 @@ def load_params(params_df: pd.DataFrame) -> Dict[str, object]:
         if typ == "entier":
             try: out[cle] = int(float(val))
             except (TypeError, ValueError): out[cle] = 0
+        elif typ in {"decimal", "reel", "float"}:
+            try: out[cle] = float(val)
+            except (TypeError, ValueError): out[cle] = 0.0
         elif typ == "liste":
             out[cle] = split_kw(val)
         else:
@@ -391,12 +406,25 @@ def load_axes_config(axes_df: pd.DataFrame) -> Dict[str, Dict[str, Dict]]:
         code = clean(row.get("code", ""))
         if not axe or not code:
             continue
-        out.setdefault(axe, {})[code] = {
+        cfg = {
             "label": clean(row.get("label", "")) or code,
-            "couleur": clean(row.get("couleur", "")) or "#666666",
+            "couleur": clean(row.get("couleur", "")),
             "symbole": clean(row.get("symbole", "")),
-            "ordre": int(row.get("ordre", 99) or 99),
+            "ordre": int(float(row.get("ordre", 9999) or 9999)),
+            "description": clean(row.get("description", "")),
+            "label_court": clean(row.get("label_court", "")),
+            "note_restitution": clean(row.get("note_restitution", "")),
+            "pct_min": None,
+            "pct_max": None,
         }
+        for key in ("pct_min", "pct_max"):
+            value = row.get(key, "")
+            if value not in (None, ""):
+                try:
+                    cfg[key] = float(value)
+                except (TypeError, ValueError):
+                    cfg[key] = None
+        out.setdefault(axe, {})[code] = cfg
     return out
 
 
@@ -481,14 +509,14 @@ def enrichir_glossaire(gloss: pd.DataFrame, conv_pages: List[Tuple[int,str]],
             phrases = re.split(r'(?<=[.!?])\s+', txt.replace("\n", " "))
             for phrase in phrases:
                 phrase = clean(phrase)
-                if len(phrase) < 30 or len(phrase) > 300:
+                phrase_min = p_int(ENGINE_PARAMS_GLOBAL, "gloss_phrase_longueur_min", 0)
+                phrase_max = p_int(ENGINE_PARAMS_GLOBAL, "gloss_phrase_longueur_max", 10**9)
+                if len(phrase) < phrase_min or len(phrase) > phrase_max:
                     continue
                 sc = sum(1 for m in mots if contains(phrase, m))
                 if sc == 0:
                     continue  # le mot-clé doit être présent -- le bonus seul ne doit jamais suffire
-                if any(w in norm(phrase) for w in
-                       ["est ", "designe ", "signifie ", "correspond ", "permet ",
-                        "defini", "represente", "constitue", "comprend"]):
+                if _matches_filter_type(phrase, "DEFINITION_SIGNAL"):
                     sc += 1
                 if sc > best_score:
                     best_score  = sc
@@ -497,11 +525,14 @@ def enrichir_glossaire(gloss: pd.DataFrame, conv_pages: List[Tuple[int,str]],
                     # phrase ne doit jamais être coupé par la troncature à 250c.
                     pos_kw = next((norm(phrase).find(norm(m)) for m in mots
                                    if norm(m) and norm(m) in norm(phrase)), 0)
-                    if pos_kw > 150:
-                        deb = max(0, pos_kw - 100)
-                        best_phrase = phrase[deb:deb + 250]
+                    centre_threshold = p_int(ENGINE_PARAMS_GLOBAL, "gloss_extrait_centrage_seuil", 0)
+                    backtrack = p_int(ENGINE_PARAMS_GLOBAL, "gloss_extrait_recul", 0)
+                    excerpt_max = p_int(ENGINE_PARAMS_GLOBAL, "gloss_extrait_longueur_max", len(phrase))
+                    if centre_threshold and pos_kw > centre_threshold:
+                        deb = max(0, pos_kw - backtrack)
+                        best_phrase = phrase[deb:deb + excerpt_max]
                     else:
-                        best_phrase = phrase[:250]
+                        best_phrase = phrase[:excerpt_max]
                     best_page   = str(pg)
                     best_source = src
 
@@ -511,7 +542,8 @@ def enrichir_glossaire(gloss: pd.DataFrame, conv_pages: List[Tuple[int,str]],
         # fréquente dans les conventions BIM), chercher simplement une fenêtre
         # de texte autour de la première occurrence du mot-clé. Une citation
         # imparfaite reste bien plus utile qu'aucune citation du tout.
-        if best_score < 2:
+        definition_score_min = p_int(ENGINE_PARAMS_GLOBAL, "gloss_definition_score_min", 0)
+        if best_score < definition_score_min:
             best_phrase, best_page, best_source = "", "", ""
             for pg, txt, src in all_pages:
                 low = txt.lower()
@@ -519,11 +551,13 @@ def enrichir_glossaire(gloss: pd.DataFrame, conv_pages: List[Tuple[int,str]],
                     i = trouve_position(low, m)
                     if i == -1:
                         continue
-                    start = max(0, i - 80)
-                    extrait = clean(txt[start:i + len(m) + 80])
+                    fallback_context = p_int(ENGINE_PARAMS_GLOBAL, "gloss_repli_contexte", 0)
+                    start = max(0, i - fallback_context)
+                    extrait = clean(txt[start:i + len(m) + fallback_context])
                     if re.search(r"\.{4,}", extrait):  # ignorer les lignes de sommaire
                         continue
-                    best_phrase, best_page, best_source = extrait[:250], str(pg), src
+                    excerpt_max = p_int(ENGINE_PARAMS_GLOBAL, "gloss_extrait_longueur_max", len(extrait))
+                    best_phrase, best_page, best_source = extrait[:excerpt_max], str(pg), src
                     break
                 if best_page:
                     break
@@ -531,14 +565,50 @@ def enrichir_glossaire(gloss: pd.DataFrame, conv_pages: List[Tuple[int,str]],
         result.append({
             "terme":            terme,
             "definition_excel": def_excel,
-            "definition_doc":   best_phrase if (best_score >= 2 or best_page) else "",
+            "definition_doc":   best_phrase if (best_score >= definition_score_min or best_page) else "",
             "page_doc":         best_page,
             "source_doc":       best_source,
             "source_excel":     clean(row.get("source", "")),
+            "explication_tpe_pme": clean(row.get("explication_tpe_pme", "")),
             "categorie":        clean(row.get("categorie", "")),
             "niveau":           clean(row.get("niveau", "")),
         })
     return result
+
+
+def glossary_entries_detected_documents(gloss: pd.DataFrame, conv_pages: List[Tuple[int, str]],
+                                         cctp_pages: List[Tuple[int, str]]) -> List[Dict]:
+    """Construit le glossaire autonome uniquement depuis les termes réellement
+    repérés dans les documents métier analysés (Convention BIM + CCTP).
+
+    La définition reste celle du référentiel Excel ; la source et la page sont
+    celles de l'occurrence documentaire retenue par ``enrichir_glossaire``.
+    Le CCAP n'est volontairement pas pris en compte ici : il conserve son rôle
+    de hiérarchie documentaire et de vigilance, sans alimenter le glossaire BIM.
+    """
+    enriched = enrichir_glossaire(gloss, conv_pages or [], cctp_pages or [])
+    out: List[Dict] = []
+    for item in enriched:
+        term = clean(item.get("terme", ""))
+        definition = clean(item.get("definition_excel", ""))
+        page = clean(item.get("page_doc", ""))
+        source_doc = clean(item.get("source_doc", ""))
+        if not term or not definition or not page or not source_doc:
+            continue
+        out.append({
+            "term": term,
+            "definition": definition,
+            "practice": clean(item.get("explication_tpe_pme", "")),
+            # Compatibilite historique : source reste l'occurrence du DCE.
+            "source": f"{source_doc} p.{page}",
+            "detected_in": f"{source_doc} p.{page}",
+            "reference": clean(item.get("source_excel", "")),
+            "source_doc": source_doc,
+            "page": page,
+            "category": clean(item.get("categorie", "")),
+        })
+    return sorted(out, key=lambda item: item["term"].casefold())
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LECTURE PDF
@@ -548,14 +618,79 @@ class DocData:
     name: str
     pages: List[Tuple[int, str]]
     text: str = field(default="", repr=False)
+    # Informations purement techniques sur la composition visuelle des pages.
+    # Elles servent uniquement à repérer une page image sans couche texte
+    # suffisante ; aucune règle métier BIM n'en dépend.
+    page_visual_info: Dict[int, Dict[str, float]] = field(default_factory=dict, repr=False)
+    _segments_cache: Optional[List[Tuple[int, str]]] = field(default=None, repr=False)
+
+def _reparer_texte_affichage(value: str) -> str:
+    """Répare, uniquement pour la restitution, quelques pertes Unicode typiques
+    de l'extraction PDF sans modifier le texte utilisé par le moteur d'analyse.
+
+    Les remplacements sont volontairement contextuels afin de conserver les vrais
+    points d'interrogation et les paramètres d'URL.
+    """
+    txt = str(value or "")
+    txt = re.sub(r"\b([dD])\?\?uvre\b", lambda m: m.group(1) + "’œuvre", txt)
+    prefixes = r"(?:[cdjlmnst]|qu|jusqu|lorsqu|puisqu|quoiqu|quelqu|aujourd)"
+    txt = re.sub(
+        rf"\b({prefixes})\?(?=[A-Za-zÀ-ÖØ-öø-ÿ])",
+        lambda m: m.group(1) + "’",
+        txt,
+        flags=re.IGNORECASE,
+    )
+    return txt
+
+def _reparer_obj_affichage(value):
+    """Applique la réparation d'affichage récursivement sans toucher aux objets métier."""
+    if isinstance(value, str):
+        return _reparer_texte_affichage(value)
+    if isinstance(value, dict):
+        return {k: _reparer_obj_affichage(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_reparer_obj_affichage(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_reparer_obj_affichage(v) for v in value)
+    return value
 
 def lire_pdf(path: Path) -> DocData:
     doc = fitz.open(str(path))
     raw_pages = []
-    for pg in doc:
+    page_visual_info: Dict[int, Dict[str, float]] = {}
+    for page_no, pg in enumerate(doc, start=1):
         txt = pg.get_text("text").replace("\xa0", " ")
         txt = re.sub(r"[ \t]+", " ", txt)
         raw_pages.append(txt)
+
+        # Une photographie / numérisation pleine page est généralement un seul
+        # grand objet image. On mesure uniquement la couverture géométrique de
+        # la plus grande image de la page. Cette information permet de distinguer
+        # une vraie page image d'une page blanche, d'un intertitre ou d'une page
+        # contenant simplement un petit logo.
+        page_area = max(float(pg.rect.width * pg.rect.height), 1.0)
+        max_image_ratio = 0.0
+        image_count = 0
+        try:
+            image_infos = pg.get_image_info()
+        except Exception:
+            image_infos = []
+        for info in image_infos or []:
+            bbox = info.get("bbox")
+            if not bbox:
+                continue
+            try:
+                rect = fitz.Rect(bbox)
+                area = max(0.0, float(rect.width * rect.height))
+            except Exception:
+                continue
+            image_count += 1
+            max_image_ratio = max(max_image_ratio, min(1.0, area / page_area))
+        page_visual_info[page_no] = {
+            "max_image_ratio": max_image_ratio,
+            "image_count": float(image_count),
+        }
+
     # Détection générique des en-têtes/pieds de page répétés sur ce document précis
     running_headers = detect_running_headers(raw_pages)
     pages = []
@@ -563,8 +698,85 @@ def lire_pdf(path: Path) -> DocData:
         txt = clean_page_headers(txt, running_headers)
         txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
         pages.append((i, txt))
+    doc.close()
     return DocData(name=path.name, pages=pages,
-                   text=" ".join(t for _, t in pages))
+                   text=" ".join(t for _, t in pages),
+                   page_visual_info=page_visual_info)
+
+
+def evaluer_lisibilite_document(doc: DocData, params: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+    """Évalue si un PDF contient une couche texte réellement exploitable.
+
+    Le contrôle ne réalise pas d'OCR : il mesure le texte extrait par PyMuPDF
+    et, page par page, la présence éventuelle d'une grande image couvrant la
+    page. Les seuils sont pilotés par 05_Parametres_Moteur.
+
+    États :
+      - OK : texte suffisamment présent et aucune page image non lisible repérée ;
+      - PARTIEL : au moins une page vraisemblablement scannée/image sans couche
+        texte suffisante, ou une proportion importante de pages sans texte ;
+      - NON_EXPLOITABLE : texte global trop faible pour analyser le document sans
+        risque de conclure à tort à l'absence d'exigence.
+
+    Une page courte ou blanche n'est pas assimilée à une page scannée uniquement
+    parce qu'elle contient peu de texte : il faut également qu'une image couvre
+    une part importante de la page.
+    """
+    params = params or ENGINE_PARAMS_GLOBAL or {}
+    page_min = max(1, p_int(params, "pdf_lecture_page_chars_min", 20))
+    total_min = max(1, p_int(params, "pdf_lecture_total_chars_min", 80))
+    ratio_partial = p_float(params, "pdf_lecture_ratio_pages_partiel", 0.5)
+    ratio_pages_min = max(1, p_int(params, "pdf_lecture_pages_min_ratio", 3))
+    image_ratio_min = p_float(params, "pdf_lecture_image_couverture_min", 0.65)
+    image_ratio_min = min(1.0, max(0.05, image_ratio_min))
+
+    counts: List[int] = []
+    pages_images_non_lisibles: List[int] = []
+    page_details: List[Dict[str, object]] = []
+    for page_no, text in (doc.pages or []):
+        # Les espaces, ponctuations et traits de mise en page ne doivent pas
+        # suffire à faire croire qu'une couche texte exploitable existe.
+        count = sum(1 for ch in str(text or "") if ch.isalnum())
+        counts.append(count)
+        visual = (doc.page_visual_info or {}).get(page_no, {})
+        image_ratio = float(visual.get("max_image_ratio", 0.0) or 0.0)
+        page_image_non_lisible = count < page_min and image_ratio >= image_ratio_min
+        if page_image_non_lisible:
+            pages_images_non_lisibles.append(int(page_no))
+        page_details.append({
+            "page": int(page_no),
+            "caracteres": count,
+            "max_image_ratio": image_ratio,
+            "image_non_lisible": page_image_non_lisible,
+        })
+
+    pages_total = len(counts)
+    pages_lisibles = sum(1 for count in counts if count >= page_min)
+    chars_total = sum(counts)
+    ratio = (pages_lisibles / pages_total) if pages_total else 0.0
+
+    if pages_total == 0 or pages_lisibles == 0 or chars_total < total_min:
+        statut = "NON_EXPLOITABLE"
+    elif pages_images_non_lisibles:
+        # Même une seule page image peut contenir une exigence importante.
+        # On poursuit l'analyse du reste du document mais on expose précisément
+        # l'angle mort au lieu de le masquer derrière un ratio global élevé.
+        statut = "PARTIEL"
+    elif pages_total >= ratio_pages_min and ratio < ratio_partial:
+        statut = "PARTIEL"
+    else:
+        statut = "OK"
+
+    return {
+        "statut": statut,
+        "pages_total": pages_total,
+        "pages_lisibles": pages_lisibles,
+        "ratio_pages_lisibles": ratio,
+        "caracteres_extraits": chars_total,
+        "pages_images_non_lisibles": pages_images_non_lisibles,
+        "pages_images_non_lisibles_count": len(pages_images_non_lisibles),
+        "page_details": page_details,
+    }
 
 def segments(doc: DocData) -> List[Tuple[int, str]]:
     """
@@ -574,6 +786,8 @@ def segments(doc: DocData) -> List[Tuple[int, str]]:
     2. Découper sur les numéros de section (2.14, 3.1 etc.)
     3. Filtrer : hors-BIM, titres seuls, trop courts
     """
+    if doc._segments_cache is not None:
+        return doc._segments_cache
     out = []
     for page, raw in doc.pages:
         txt = re.sub(r"Page\s+\d+\s+sur\s+\d+", " ", raw, flags=re.I)
@@ -586,216 +800,713 @@ def segments(doc: DocData) -> List[Tuple[int, str]]:
             txt)
         for part in parts:
             part = clean(part)
-            if len(part) < 40: continue
+            min_len = p_int(ENGINE_PARAMS_GLOBAL, "segment_longueur_min", 0)
+            if len(part) < min_len: continue
             if is_hors_bim(part): continue
             # Exclure les lignes de sommaire avec pointillés
-            if part.count('.') > len(part) * 0.3: continue
+            dotted_ratio = p_float(ENGINE_PARAMS_GLOBAL, "segment_ratio_pointilles_max", 1.0)
+            if len(part) and part.count('.') > len(part) * dotted_ratio: continue
             # Exclure les titres purs (court + tout en majuscules ou numéro seul)
-            if re.match(r"^\d+\.?\d*\s+[A-Z]{3}", part) and len(part) < 80: continue
-            if len(part) > 500: part = part[:497] + "..."
+            title_max = p_int(ENGINE_PARAMS_GLOBAL, "segment_titre_longueur_max", 0)
+            if re.match(r"^\d+\.?\d*\s+[A-Z]{3}", part) and title_max and len(part) < title_max: continue
+            segment_max = p_int(ENGINE_PARAMS_GLOBAL, "segment_longueur_max", len(part))
+            if segment_max and len(part) > segment_max:
+                part = part[:max(0, segment_max - len("..."))] + "..."
             out.append((page, part))
+    doc._segments_cache = out
     return out
 
 def score_seg(txt: str, kws: List[str], strong: List[str]) -> int:
-    sc = 0
-    for k in kws:
-        if contains(txt, k): sc += 3
-    for k in strong:
-        if contains(txt, k): sc += 7
-    if has_bim_signal(txt): sc += 10  # Signal BIM structurant = prioritaire
-    for w in ["doit","devra","doivent","obligatoire","est attendu",
-              "à fournir","livrable","conforme","déposer"]:
-        if contains(txt, w): sc += 2
-    if is_hors_bim(txt): sc -= 60
-    return sc
-
-# Termes trop génériques pour justifier, seuls, qu’un extrait prouve un bloc.
-# Cette liste est transversale (aucun id_bloc) : elle empêche par exemple qu’un
-# passage générique sur une « maquette DOE » soit retenu pour un bloc portant
-# sur les paramètres, la codification ou les nomenclatures.
-_EVIDENCE_GENERIC_TERMS = {
-    "bim", "ifc", "maquette", "maquette numerique", "modele", "modele numerique",
-    "information", "informations", "donnee", "donnees", "livrable", "livrables",
-    "description", "type", "famille", "fabricant", "mise a jour", "format natif",
-}
+    params = ENGINE_PARAMS_GLOBAL
+    score = 0
+    score += p_int(params, "score_poids_mot_cle", 0) * sum(1 for k in kws if keyword_has_non_negated_occurrence(txt, k))
+    score += p_int(params, "score_poids_signal_fort", 0) * sum(1 for k in strong if keyword_has_non_negated_occurrence(txt, k))
+    if has_bim_signal(txt):
+        score += p_int(params, "score_bonus_signal_bim", 0)
+    obligation_count = sum(1 for motif, mode in TEXT_FILTERS.get("OBLIGATION", []) if _filter_match(txt, motif, mode))
+    score += p_int(params, "score_bonus_formulation_obligation", 0) * obligation_count
+    if is_hors_bim(txt):
+        score -= p_int(params, "score_penalite_hors_bim", 0)
+    return score
 
 
 def _evidence_matches(txt: str, kws: List[str], strong: List[str]) -> Tuple[List[str], List[str], List[str]]:
-    """Retourne (mots ordinaires, signaux forts, mots ordinaires spécifiques)."""
-    matched = [k for k in kws if k and contains(txt, k)]
-    matched_strong = [k for k in strong if k and contains(txt, k)]
+    matched = [k for k in kws if k and keyword_has_non_negated_occurrence(txt, k)]
+    matched_strong = [k for k in strong if k and keyword_has_non_negated_occurrence(txt, k)]
+    generic = {norm(motif) for motif, _ in TEXT_FILTERS.get("EVIDENCE_GENERIC", [])}
+    min_len = p_int(ENGINE_PARAMS_GLOBAL, "preuve_longueur_min_terme_specifique", 0)
+    acr_min = p_int(ENGINE_PARAMS_GLOBAL, "preuve_acronyme_longueur_min", 0)
+    acr_max = p_int(ENGINE_PARAMS_GLOBAL, "preuve_acronyme_longueur_max", 9999)
     specific = []
     for k in matched:
         nk = norm(k)
-        # Une expression multi-mots, un terme suffisamment long ou un acronyme
-        # métier est considéré comme ciblé, sauf s’il appartient au socle BIM
-        # très générique ci-dessus.
-        is_acronym = str(k).strip().isupper() and 3 <= len(str(k).strip()) <= 8
-        is_specific = (" " in nk or len(nk) >= 7 or is_acronym) and nk not in _EVIDENCE_GENERIC_TERMS
+        raw = str(k).strip()
+        is_acronym = raw.isupper() and acr_min <= len(raw) <= acr_max
+        is_specific = (" " in nk or len(nk) >= min_len or is_acronym) and nk not in generic
         if is_specific:
             specific.append(k)
     return matched, matched_strong, specific
 
 
+def _sujets_lot_nommes(texte: object) -> List[str]:
+    """Extrait uniquement les sujets explicitement rédigés sous la forme
+    « le lot X + verbe ». Les destinataires (« au lot X ») ne sont pas traités
+    comme des sujets. Les verbes viennent du classeur de paramétrage ; aucun
+    corps d'état n'est connu du moteur.
+    """
+    # Travailler sur la représentation normalisée (accents, ligatures, tirets,
+    # apostrophes et casse neutralisés) afin que la portée d'une clause ne
+    # dépende jamais de la qualité typographique/OCR du PDF. Les acteurs
+    # extraits servent uniquement à une comparaison normalisée de portée.
+    text = norm(texte)
+    if not text:
+        return []
+    raw_verbs = ENGINE_PARAMS_GLOBAL.get("cctp_acteur_lot_verbes", "")
+    if isinstance(raw_verbs, (list, tuple, set)):
+        verbs = [clean(v) for v in raw_verbs if clean(v)]
+    else:
+        verbs = split_kw(raw_verbs)
+    if not verbs:
+        verbs = ["doit", "devra", "réalise", "réalisera", "fournit", "fournira",
+                 "produit", "produira", "remet", "remettra", "dépose", "déposera",
+                 "développe", "développera", "modélise", "modélisera",
+                 "transmet", "transmettra"]
+    verb_pat = "|".join(sorted((re.escape(norm(v)) for v in verbs if clean(v)), key=len, reverse=True))
+    if not verb_pat:
+        return []
+    patterns = [
+        re.compile(r"(?i)\b(?:le|la)\s+lot\s+(?P<acteur>[^.;:\n]{1,110}?)\s+(?:" + verb_pat + r")\b"),
+        re.compile(r"(?im)^\s*lot\s+(?P<acteur>[^.;:\n]{1,110}?)\s+(?:" + verb_pat + r")\b"),
+    ]
+    actors: List[str] = []
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            actor = clean(match.group("acteur"))
+            if actor and actor.casefold() not in {a.casefold() for a in actors}:
+                actors.append(actor)
+    return actors
+
+
+def _clause_compatible_portee_lot(texte: object, lot: object) -> bool:
+    """Filtre de sécurité transversal des preuves CCTP.
+
+    - aucune désignation explicite de sujet « lot X » : la clause reste valable
+      comme clause générale du CCTP ;
+    - un ou plusieurs sujets « lot X » sont nommés : au moins un doit
+      correspondre au lot analysé.
+
+    Le mécanisme évite qu'une prescription visant explicitement un autre lot
+    confirme l'exigence du lot courant, sans dictionnaire de corps d'état.
+    """
+    enabled = clean(ENGINE_PARAMS_GLOBAL.get("cctp_filtrer_acteur_lot_explicite", "Oui")).lower()
+    if enabled in {"non", "no", "false", "0"}:
+        return True
+    actors = _sujets_lot_nommes(texte)
+    if not actors:
+        return True
+    return any(_portee_lot_correspond(actor, lot) for actor in actors)
+
+
+def _texte_document_compatible_lot(doc: Optional[DocData], lot: object) -> str:
+    if not doc:
+        return ""
+    kept = [seg for _page, seg in segments(doc) if _clause_compatible_portee_lot(seg, lot)]
+    return "\n".join(kept)
+
+
 def best_evidence(doc: Optional[DocData], kws: List[str], strong: List[str],
-                  used: set) -> Tuple[str, str, int, str]:
-    """
-    Sélectionne un extrait réellement rattaché au bloc.
-
-    Un simple signal BIM générique ne suffit plus. Le passage doit contenir :
-      - au moins un signal fort du bloc ; ou
-      - au moins deux mots-clés du bloc ; ou
-      - au moins un mot-clé suffisamment spécifique.
-
-    Cette règle évite les preuves hors sujet et conserve les clauses métier
-    explicites même lorsqu’elles ne contiennent pas le mot « BIM » (par ex.
-    « le titulaire devra renseigner ce tableau Excel »).
-    """
+                  used: set, lot: str = "", enforce_lot_scope: bool = False) -> Tuple[str, str, int, str]:
     if not doc:
         return "", "", -999, ""
     best_sc, best_pg, best_txt, best_key = -999, "", "", ""
+    min_kw = p_int(ENGINE_PARAMS_GLOBAL, "preuve_min_mots_cles", 0)
+    min_specific_no_bim = p_int(ENGINE_PARAMS_GLOBAL, "preuve_min_specificites_sans_signal_bim", 0)
     for page, seg in segments(doc):
-        key = norm(seg[:160])
+        if enforce_lot_scope and lot and not _clause_compatible_portee_lot(seg, lot):
+            continue
+        dedup_len = p_int(ENGINE_PARAMS_GLOBAL, "preuve_cle_dedoublonnage_longueur", len(seg))
+        key = norm(seg[:dedup_len])
         if key in used:
             continue
-
         matched, matched_strong, specific = _evidence_matches(seg, kws, strong)
-        eligible = bool(matched_strong or len(set(map(norm, matched))) >= 2 or specific)
+        eligible = bool(matched_strong or len(set(map(norm, matched))) >= min_kw or specific)
         if not eligible:
             continue
-
         sc = score_seg(seg, kws, strong)
-        # Bonus de ciblage : à score proche, privilégier l’extrait qui contient
-        # le vocabulaire le plus propre au bloc plutôt qu’un paragraphe BIM large.
-        sc += 4 * len(set(map(norm, specific)))
-        sc += 3 * len(set(map(norm, matched_strong)))
-
-        # L’absence d’un signal BIM générique ne doit pas éliminer une clause
-        # explicite et ciblée. On ne pénalise que les candidats sans signal fort
-        # et faiblement spécifiques.
-        if not has_bim_signal(seg) and not matched_strong and len(specific) < 2:
-            sc -= 4
-
+        sc += p_int(ENGINE_PARAMS_GLOBAL, "preuve_bonus_terme_specifique", 0) * len(set(map(norm, specific)))
+        sc += p_int(ENGINE_PARAMS_GLOBAL, "preuve_bonus_signal_fort", 0) * len(set(map(norm, matched_strong)))
+        if not has_bim_signal(seg) and not matched_strong and len(specific) < min_specific_no_bim:
+            sc -= p_int(ENGINE_PARAMS_GLOBAL, "preuve_penalite_sans_signal_bim", 0)
         if sc > best_sc:
             best_sc, best_pg, best_txt, best_key = sc, str(page), seg, key
-
-    if best_sc < 8 or not best_txt:
+    threshold = p_int(ENGINE_PARAMS_GLOBAL, "seuil_preuve_ciblee", 0)
+    if best_sc < threshold or not best_txt:
         return "", "", best_sc, ""
     return best_pg, clean_proof_text(best_txt), best_sc, best_key
 
 
-def appliquer_gouvernance_preuves(resultats: Dict[str, Dict], conv_text: str, cctp_text: str, lot: str) -> None:
-    """Durcit la cohérence statut/preuve/lot après sélection des extraits.
+def appliquer_gouvernance_preuves(resultats: Dict[str, Dict], params: Dict[str, object]) -> None:
+    """Reconstruit l'axe présence uniquement depuis les preuves conservées.
 
-    Principes : une preuve d'un autre lot est rejetée, une exclusion explicite
-    prime sur une occurrence positive et aucun statut actif n'est conservé sans
-    extrait affichable. Les statuts techniques historiques restent compatibles
-    avec le reste du moteur, tandis que les libellés publics sont gérés par les
-    générateurs de livrables.
+    Aucune exception par bloc, corps d'état ou usage BIM n'est définie ici :
+    les règles de détection/exclusion restent dans le classeur de paramétrage.
     """
-    lot_n = norm(lot or "")
-    all_text = norm((conv_text or "") + " " + (cctp_text or ""))
+    code_abs = p_text(params, "presence_code_absente")
+    code_conv = p_text(params, "presence_code_convention")
+    code_cctp = p_text(params, "presence_code_cctp")
+    code_both = p_text(params, "presence_code_convention_cctp")
+    for res in resultats.values():
+        has_conv = bool(clean(res.get("conv_pf", "")))
+        has_cctp = bool(clean(res.get("cctp_pf", "")))
+        if has_conv and has_cctp:
+            res["presence_contractuelle"] = code_both
+        elif has_conv:
+            res["presence_contractuelle"] = code_conv
+        elif has_cctp:
+            res["presence_contractuelle"] = code_cctp
+        else:
+            res["presence_contractuelle"] = code_abs
 
-    def autre_lot(txt: str) -> bool:
-        n = norm(txt or "")
-        if not n:
-            return False
-        # Cas explicites fréquents : une clause limitée à un autre corps d'état.
-        autres = ("cvc", "plomberie", "electricite", "structure", "charpente", "lot 03")
-        facade = any(x in lot_n for x in ("facade", "bardage", "couverture", "etancheite"))
-        return facade and any(x in n for x in autres) and not any(x in n for x in ("facade", "bardage", "couverture", "etancheite", "tous les lots"))
+def _valeur_regle_correspond(actual: object, expected: object) -> bool:
+    """Comparaison générique des conditions déclarées dans les feuilles de règles."""
+    exp = [clean(x) for x in str(expected or "").split(";") if clean(x)]
+    if not exp:
+        return True
+    actual_text = clean(actual)
+    actual_norm = norm(actual_text)
+    positives, negatives = [], []
+    for token in exp:
+        neg = token.startswith("!")
+        raw = token[1:] if neg else token
+        raw_upper = clean(raw).upper()
+        if raw_upper == "VIDE":
+            ok = not actual_text
+        elif raw_upper == "NON_VIDE":
+            ok = bool(actual_text)
+        else:
+            ok = actual_norm == norm(raw)
+        (negatives if neg else positives).append(ok)
+    if any(negatives):
+        return False
+    return any(positives) if positives else True
 
-    def rejet(res: Dict, champ: str) -> None:
-        res[champ] = ""
-        res[champ.replace("_pf", "_pg")] = ""
-        res[champ.replace("_pf", "_extrait")] = ""
+
+def appliquer_regles_interblocs(resultats: Dict[str, Dict], regles: List[Dict[str, object]]) -> None:
+    """Applique 18_Regles_Interblocs sans connaissance métier des blocs dans Python."""
+    def _ordre(row: Dict[str, object]) -> int:
+        # Cycle 41 : l'ordre de résolution d'une preuve peut être distinct de
+        # l'ordre historique de la règle. La priorité reste entièrement
+        # paramétrée dans Excel (19_Regles_Documentaires). Si la nouvelle
+        # colonne est vide, le comportement antérieur basé sur ``ordre`` est
+        # conservé à l'identique.
+        raw = row.get("priorite_resolution", "")
+        if clean(raw):
+            try:
+                return int(float(raw))
+            except (TypeError, ValueError):
+                pass
+        try:
+            return int(float(row.get("ordre", 9999)))
+        except (TypeError, ValueError):
+            return 9999
+    for rule in sorted(regles or [], key=_ordre):
+        if clean(rule.get("actif", "Oui")).lower() == "non":
+            continue
+        src = resultats.get(clean(rule.get("bloc_source")))
+        tgt = resultats.get(clean(rule.get("bloc_cible")))
+        if not src or not tgt:
+            continue
+        champ_src = clean(rule.get("champ_source"))
+        champ_cond = clean(rule.get("champ_condition_cible"))
+        champ_cond_2 = clean(rule.get("champ_condition_cible_2"))
+        if champ_src and not _valeur_regle_correspond(src.get(champ_src, ""), rule.get("valeurs_source", "")):
+            continue
+        if champ_cond and not _valeur_regle_correspond(tgt.get(champ_cond, ""), rule.get("valeurs_condition_cible", "")):
+            continue
+        if champ_cond_2 and not _valeur_regle_correspond(tgt.get(champ_cond_2, ""), rule.get("valeurs_condition_cible_2", "")):
+            continue
+        champ_cible = clean(rule.get("champ_cible"))
+        if champ_cible:
+            valeur = clean(rule.get("valeur_cible"))
+            # Conserver le type du champ cible quand il existe déjà. Cela permet
+            # aux règles Excel de modifier aussi des indicateurs booléens sans
+            # introduire de sémantique métier dans le moteur.
+            if isinstance(tgt.get(champ_cible), bool):
+                valeur = valeur.lower() in {"oui", "yes", "true", "1"}
+            tgt[champ_cible] = valeur
+        if clean(rule.get("marquer_exclusion_interbloc")).lower() in {"oui", "yes", "true", "1"}:
+            tgt["interblock_exclusion"] = True
+            tgt["interblock_reason"] = clean(rule.get("message"))
+            # Conserver la preuve ayant déclenché l'exclusion interbloc afin que
+            # les livrables puissent expliquer la décision. Le mécanisme est
+            # générique : aucune connaissance de l'identité du bloc source/cible.
+            tgt["interblock_source_evidence"] = {
+                "conv_pf": clean(src.get("conv_pf")),
+                "conv_pg": clean(src.get("conv_pg")),
+                "cctp_pf": clean(src.get("cctp_pf")),
+                "cctp_pg": clean(src.get("cctp_pg")),
+            }
+            if tgt["interblock_reason"]:
+                tgt["conclusion"] = tgt["interblock_reason"]
+
+
+def _rule_text_match(text: str, all_terms: object, any_terms: object, excluded_terms: object) -> bool:
+    all_kws = split_kw(all_terms)
+    any_kws = split_kw(any_terms)
+    excluded = split_kw(excluded_terms)
+    if not text:
+        return False
+    # Les termes positifs doivent disposer d'au moins une occurrence non niée
+    # localement. Lorsqu'une négation fait déjà partie du terme configuré dans
+    # Excel, elle n'est pas extérieure à son occurrence et la règle continue à
+    # fonctionner comme paramétrée.
+    if all_kws and not all(keyword_has_non_negated_occurrence(text, kw) for kw in all_kws):
+        return False
+    if any_kws and not any(keyword_has_non_negated_occurrence(text, kw) for kw in any_kws):
+        return False
+    if excluded and any(contains(text, kw) for kw in excluded):
+        return False
+    return bool(all_kws or any_kws or not excluded)
+
+
+def _portee_lot_tokens(value: object) -> set[str]:
+    """Retourne des jetons normalisés utilisables pour comparer un libellé de lot
+    avec un acteur/périmètre extrait d'une clause. Les mots vides viennent du
+    paramétrage moteur ; aucune discipline ni aucun lot n'est codé en dur.
+    """
+    stopwords = {
+        norm(x) for x in (ENGINE_PARAMS_GLOBAL.get("portee_lot_mots_vides") or [])
+        if clean(x)
+    }
+    tokens: set[str] = set()
+    acronym_min = max(2, p_int(ENGINE_PARAMS_GLOBAL, "portee_lot_acronyme_longueur_min", 2))
+    acronym_max = max(acronym_min, p_int(ENGINE_PARAMS_GLOBAL, "portee_lot_acronyme_longueur_max", 8))
+    # On tokenise le libellé original pour conserver l'information de casse.
+    # Un acronyme court en capitales (2..N caractères paramétrés) peut être
+    # significatif, alors qu'un mot ordinaire de moins de 3 caractères reste
+    # ignoré. Aucun acronyme de discipline n'est codé en dur.
+    for raw in re.findall(r"[A-Za-zÀ-ÿ0-9]+", clean(value)):
+        token = norm(raw)
+        is_short_acronym = (
+            raw.isupper()
+            and any(ch.isalpha() for ch in raw)
+            and acronym_min <= len(raw) <= acronym_max
+        )
+        if not token or token.isdigit() or (len(token) < 3 and not is_short_acronym) or token in stopwords:
+            continue
+        # Canonicalisation minimale des pluriels fréquents afin de rapprocher
+        # des libellés singulier/pluriel sans dictionnaire métier.
+        if len(token) > 4 and token.endswith("s"):
+            token = token[:-1]
+        if token and token not in stopwords:
+            tokens.add(token)
+    return tokens
+
+
+def _portee_lot_correspond(scope_text: object, lot: object, min_tokens: object = None) -> bool:
+    """Vérifie génériquement qu'une clause visant un acteur correspond au lot analysé.
+
+    Le seuil et les mots vides sont paramétrés dans 05_Parametres_Moteur.
+    En cas de périmètre non identifiable, la fonction échoue de manière sûre
+    (False) afin de ne jamais exclure un bloc sur une clause visant un autre acteur.
+    """
+    scope_tokens = _portee_lot_tokens(scope_text)
+    lot_tokens = _portee_lot_tokens(lot)
+    if not scope_tokens or not lot_tokens:
+        return False
+    try:
+        threshold = int(float(min_tokens)) if clean(min_tokens) else p_int(ENGINE_PARAMS_GLOBAL, "portee_lot_min_tokens_defaut", 1)
+    except (TypeError, ValueError):
+        threshold = p_int(ENGINE_PARAMS_GLOBAL, "portee_lot_min_tokens_defaut", 1)
+    threshold = max(1, threshold)
+    return len(scope_tokens & lot_tokens) >= threshold
+
+
+def appliquer_regles_documentaires(
+    resultats: Dict[str, Dict],
+    regles: List[Dict[str, object]],
+    lot: str,
+    ctx_global: Dict[str, object],
+    messages: Dict[str, str],
+    source_pages: Optional[Dict[str, List[object]]] = None,
+) -> None:
+    """Applique 19_Regles_Documentaires aux seules preuves effectivement retenues."""
+    def _ordre(row: Dict[str, object]) -> int:
+        try:
+            return int(float(row.get("ordre", 9999)))
+        except (TypeError, ValueError):
+            return 9999
+    by_block: Dict[str, List[Dict[str, object]]] = {}
+    for rule in sorted(regles or [], key=_ordre):
+        if clean(rule.get("actif", "Oui")).lower() == "non":
+            continue
+        bid = clean(rule.get("id_bloc"))
+        if bid:
+            by_block.setdefault(bid, []).append(rule)
+    source_labels = {
+        "CCTP": render_message(messages, "source_cctp_label") or "CCTP du lot",
+        "CONVENTION": render_message(messages, "source_convention_label") or "Convention BIM",
+        "CCAP": "CCAP",
+        "COMPLEMENT": render_message(messages, "source_supplement_label") or "Pièce complémentaire",
+    }
+
+    def _page_candidates(source_code: str, block_id: str) -> List[Tuple[str, str, str, str, str]]:
+        """Normalise les pages sources sans imposer leur nature au moteur.
+
+        Les entrées historiques CCTP/Convention restent des tuples (page, texte).
+        Une pièce complémentaire peut être fournie sous forme de dictionnaire avec
+        son libellé, son type de preuve et la liste des blocs auxquels l'utilisateur
+        l'a ajoutée. Ce dernier champ évite qu'une annexe ajoutée pour lever une
+        vigilance B06B ne soit utilisée aveuglément sur tous les blocs.
+        """
+        rows: List[Tuple[str, str, str, str, str]] = []
+        for entry in ((source_pages or {}).get(source_code) or []):
+            page = text = label = kind = ""
+            related: set[str] = set()
+            if isinstance(entry, dict):
+                page = clean(entry.get("page"))
+                text = str(entry.get("text") or "")
+                label = clean(entry.get("source")) or source_labels.get(source_code, source_code)
+                kind = clean(entry.get("kind")) or source_code.lower()
+                related = {clean(x).upper() for x in (entry.get("related_blocks") or []) if clean(x)}
+            elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                page = clean(entry[0])
+                text = str(entry[1] or "")
+                label = clean(entry[2]) if len(entry) >= 3 else source_labels.get(source_code, source_code)
+                kind = clean(entry[3]) if len(entry) >= 4 else source_code.lower()
+            else:
+                continue
+            if related and clean(block_id).upper() not in related:
+                continue
+            rows.append((source_code, re.sub(r"[ \t]+", " ", text).strip(), page, label, kind))
+        return rows
+    def _ordre_doc(row: Dict[str, object]) -> int:
+        raw = row.get("priorite_resolution", "")
+        if clean(raw):
+            try:
+                return int(float(raw))
+            except (TypeError, ValueError):
+                pass
+        try:
+            return int(float(row.get("ordre", 9999)))
+        except (TypeError, ValueError):
+            return 9999
 
     for bid, res in resultats.items():
-        for champ in ("conv_pf", "cctp_pf"):
-            if autre_lot(res.get(champ, "")):
-                res.setdefault("preuves_rejetees", []).append({
-                    "texte": res.get(champ, ""),
-                    "raison": "Extrait limité à un autre lot ; non recevable pour le lot analysé.",
+        for rule in sorted(by_block.get(bid, []), key=_ordre_doc):
+            # Condition interbloc générique (Cycle 46). Le bloc source, le champ
+            # observé et les valeurs attendues sont entièrement déclarés dans Excel.
+            # Le moteur ne connaît pas le sens métier de la dépendance.
+            condition_block_id = clean(rule.get("bloc_condition_source"))
+            if condition_block_id:
+                condition_result = resultats.get(condition_block_id) or {}
+                condition_field = clean(rule.get("champ_condition_bloc_source"))
+                if not condition_field or not _valeur_regle_correspond(
+                    condition_result.get(condition_field, ""),
+                    rule.get("valeurs_condition_bloc_source", ""),
+                ):
+                    continue
+            # Une règle documentaire peut être conditionnée par un champ du résultat
+            # courant. Le champ et les valeurs attendues viennent d'Excel ; le moteur
+            # reste générique et ne connaît ni le bloc ni le sens métier de la condition.
+            result_condition_field = clean(rule.get("champ_condition_resultat"))
+            if result_condition_field and not _valeur_regle_correspond(
+                res.get(result_condition_field, ""), rule.get("valeurs_condition_resultat", "")
+            ):
+                continue
+            source_req = clean(rule.get("source", "ANY")).upper()
+            search_full_document = clean(rule.get("recherche_document_complet")).lower() in {"oui", "yes", "true", "1"}
+            candidates: List[Tuple[str, str, str, str, str]] = []
+            if source_req in {"ANY", "CCTP"}:
+                if search_full_document:
+                    # Conserver les retours à la ligne pendant la recherche sur document complet.
+                    # Ils constituent une frontière de clause utile pour les regex paramétrées
+                    # dans Excel. Seuls les espaces horizontaux sont normalisés ici.
+                    candidates.extend(_page_candidates("CCTP", bid))
+                else:
+                    candidates.append(("CCTP", clean(res.get("cctp_pf")), clean(res.get("cctp_pg")), source_labels["CCTP"], "cctp"))
+            if source_req in {"ANY", "CONVENTION"}:
+                if search_full_document:
+                    candidates.extend(_page_candidates("CONVENTION", bid))
+                else:
+                    candidates.append(("CONVENTION", clean(res.get("conv_pf")), clean(res.get("conv_pg")), source_labels["CONVENTION"], "convention"))
+            # Le CCAP n'entre volontairement PAS dans ANY : seules des règles
+            # Excel explicitement déclarées source=CCAP peuvent l'utiliser comme
+            # preuve métier. Cela préserve le comportement historique tout en
+            # autorisant les clauses prescriptives ciblées.
+            if source_req == "CCAP":
+                if search_full_document:
+                    candidates.extend(_page_candidates("CCAP", bid))
+                else:
+                    candidates.append(("CCAP", "", "", source_labels["CCAP"], "ccap"))
+            # Une pièce ajoutée après la première analyse est une source explicite.
+            # Elle n'entre pas implicitement dans les règles ANY : seules les règles
+            # Excel qui déclarent source=COMPLEMENT peuvent transformer son contenu
+            # en preuve contractuelle. Cela évite qu'une annexe secondaire ne prenne
+            # automatiquement le pas sur le CCTP ou la Convention.
+            if source_req == "COMPLEMENT":
+                if search_full_document:
+                    candidates.extend(_page_candidates("COMPLEMENT", bid))
+                else:
+                    candidates.append((
+                        "COMPLEMENT", clean(res.get("supp_pf")), clean(res.get("supp_pg")),
+                        clean(res.get("supp_source")) or source_labels["COMPLEMENT"],
+                        clean(res.get("supp_kind")) or "supp0",
+                    ))
+            # Cycle 38 : lors d'une recherche sur document complet, plusieurs pages
+            # peuvent satisfaire le préfiltre lexical alors qu'une seule contient la
+            # clause structurée attendue par la regex Excel. Il faut donc chercher la
+            # première candidate qui satisfait À LA FOIS le préfiltre et la regex,
+            # au lieu de s'arrêter sur la première page contenant un mot générique.
+            extraction_regex = clean(rule.get("extraction_regex"))
+            matched = None
+            matched_extraction = None
+            for src_code, proof, page, matched_label, matched_kind in candidates:
+                if not _rule_text_match(proof, rule.get("contient_tous"), rule.get("contient_un"), rule.get("exclut")):
+                    continue
+                extraction_match = None
+                if extraction_regex:
+                    try:
+                        extraction_match = re.search(extraction_regex, proof, flags=re.I | re.S)
+                    except re.error:
+                        extraction_match = None
+                    if not extraction_match:
+                        continue
+                matched = (src_code, proof, page, matched_label, matched_kind)
+                matched_extraction = extraction_match
+                break
+            if not matched:
+                continue
+            src_code, proof, page, matched_label, matched_kind = matched
+
+            # Une regex facultative, définie dans Excel, peut isoler la clause exacte
+            # et exposer ses groupes nommés comme variables de restitution
+            # ({obligation}, {jalon}, etc.). Le code reste entièrement agnostique du bloc.
+            extracted_ctx = {}
+            if extraction_regex and matched_extraction:
+                extracted_ctx = {
+                    key: clean(value)
+                    for key, value in matched_extraction.groupdict().items()
+                    if value not in (None, "")
+                }
+                targeted_proof = clean(
+                    extracted_ctx.get("obligation")
+                    or extracted_ctx.get("preuve")
+                    or matched_extraction.group(0)
+                )
+                if targeted_proof:
+                    proof = targeted_proof
+
+            # Cycle 50 : une clause CCTP dont le sujet est explicitement un autre
+            # lot ne peut jamais devenir la preuve du lot analysé, même si une
+            # règle métier plus générale reconnaît ses mots-clés. Les clauses
+            # générales du CCTP restent, elles, admissibles.
+            if src_code == "CCTP" and not _clause_compatible_portee_lot(proof, lot):
+                continue
+
+            # Certaines règles Excel portent sur un acteur ou une discipline
+            # explicitement nommé(e) dans la clause. Lorsqu'elles activent le
+            # contrôle de portée, le moteur compare génériquement le groupe
+            # extrait (par défaut « acteur ») avec le lot analysé. Cela évite
+            # qu'une exclusion visant un autre lot ne soit appliquée globalement.
+            if clean(rule.get("verifier_portee_lot")).lower() in {"oui", "yes", "true", "1"}:
+                scope_group = clean(rule.get("groupe_portee_lot")) or "acteur"
+                scope_text = extracted_ctx.get(scope_group, "")
+                if not _portee_lot_correspond(scope_text, lot, rule.get("portee_lot_min_tokens")):
+                    continue
+
+            ctx = {
+                **(ctx_global or {}), "lot": lot,
+                **extracted_ctx,
+                "source": matched_label or source_labels.get(src_code, src_code),
+                "page": page or render_message(messages, "evidence_page_unknown"),
+                "preuve": proof,
+                # Variables génériques utilisables dans les textes Excel pour croiser
+                # les deux pièces sans coder le sens métier du bloc dans Python.
+                "page_convention": clean(res.get("conv_pg")) or render_message(messages, "evidence_page_unknown"),
+                "page_cctp": clean(res.get("cctp_pg")) or render_message(messages, "evidence_page_unknown"),
+                "preuve_convention": clean(res.get("conv_pf")),
+                "preuve_cctp": clean(res.get("cctp_pf")),
+            }
+            rule_id = clean(rule.get("id_regle"))
+            aggregation = clean(rule.get("agregation", "REMPLACE")).upper() or "REMPLACE"
+            demand_template = clean(rule.get("demande"))
+            response_template = clean(rule.get("reponse"))
+            action_template = clean(rule.get("action_standard"))
+            rendered_demand = _sub_ctx(demand_template, ctx, messages)
+            rendered_response = _sub_ctx(response_template, ctx, messages)
+            rendered_action = _sub_ctx(action_template, ctx, messages)
+
+            def _append_unique_text(existing: object, value: object) -> str:
+                current = clean(existing)
+                addition = clean(value)
+                if not addition:
+                    return current
+                if not current:
+                    return addition
+                if addition.casefold() in current.casefold():
+                    return current
+                return current.rstrip() + " " + addition
+
+            append_to_existing = aggregation == "AJOUTE" and bool(res.get("specific_rule_id"))
+            if append_to_existing:
+                res["specific_rule_id"] = _append_unique_text(res.get("specific_rule_id"), rule_id)
+                res["specific_demand"] = _append_unique_text(res.get("specific_demand"), rendered_demand)
+                res["specific_response"] = _append_unique_text(res.get("specific_response"), rendered_response)
+                res["specific_action"] = _append_unique_text(res.get("specific_action"), rendered_action)
+                res.setdefault("specific_evidence_extra", []).append({
+                    "kind": src_code.lower(),
+                    "source": matched_label or source_labels.get(src_code, src_code),
+                    "page": page,
+                    "text": proof,
                 })
-                rejet(res, champ)
+            else:
+                res["specific_rule_id"] = rule_id
+                res["specific_demand"] = rendered_demand
+                res["specific_response"] = rendered_response
+                res["specific_action"] = rendered_action
+                res["specific_source"] = src_code
+                res["specific_source_label"] = matched_label or source_labels.get(src_code, src_code)
+                res["specific_page"] = page
 
-        # Une clause de géoréférencement ne prouve pas la qualité de modélisation B11.
-        if bid == "B11":
-            for champ in ("conv_pf", "cctp_pf"):
-                n = norm(res.get(champ, ""))
-                if n and ("georeferencement" in n or "origine projet" in n) and not any(k in n for k in ("controle qualite", "autocontrole", "ifcspace", "categorie ifc", "audit", "regles de modelisation")):
-                    res.setdefault("preuves_rejetees", []).append({"texte": res.get(champ, ""), "raison": "Clause de géoréférencement sans lien direct avec la qualité de modélisation."})
-                    rejet(res, champ)
+            capacity_qids = split_kw(rule.get("questions_capacite", ""))
+            if capacity_qids:
+                existing_qids = list(res.get("capacity_question_ids") or [])
+                seen_qids = {clean(q).casefold() for q in existing_qids if clean(q)}
+                for qid in capacity_qids:
+                    if clean(qid).casefold() not in seen_qids:
+                        existing_qids.append(clean(qid))
+                        seen_qids.add(clean(qid).casefold())
+                res["capacity_question_ids"] = existing_qids
+            if clean(rule.get("origine_action_specifique")).lower() in {"oui", "yes", "true", "1"}:
+                source_label = matched_label or source_labels.get(src_code, src_code)
+                res["specific_action_origin"] = f"{source_label} p.{page}" if page else source_label
+            # Si la règle a isolé une preuve plus précise, cette clause devient aussi
+            # la preuve affichée afin que la décision soit directement auditable.
+            if extraction_regex and proof and not append_to_existing:
+                if src_code == "CCTP":
+                    res["cctp_pf"] = proof
+                    res["cctp_pg"] = page
+                    res["cctp_extrait"] = proof[:200]
+                elif src_code == "CONVENTION":
+                    res["conv_pf"] = proof
+                    res["conv_pg"] = page
+                    res["conv_extrait"] = proof[:200]
+                elif src_code == "CCAP":
+                    # Le CCAP est conservé comme preuve complémentaire traçable ;
+                    # il ne remplace pas les champs CCTP/Convention historiques.
+                    res.setdefault("specific_evidence_extra", []).append({
+                        "kind": "ccap", "source": matched_label or "CCAP",
+                        "page": page, "text": proof,
+                    })
+                elif src_code == "COMPLEMENT":
+                    res["supp_pf"] = proof
+                    res["supp_pg"] = page
+                    res["supp_source"] = matched_label or source_labels["COMPLEMENT"]
+                    res["supp_kind"] = matched_kind or "supp0"
+            # Les modes/forçages restent définis dans Excel. Le moteur se contente
+            # de les recopier dans le résultat public lorsqu'ils sont renseignés.
+            for col, target in (
+                ("action_mode_override", "action_mode_override"),
+                ("statut_public_override", "statut_public_override"),
+                ("priorite_override", "priorite_override"),
+                ("question_mode_override", "question_mode_override"),
+                ("decision_override", "decision_override"),
+                ("response_mode_override", "response_mode_override"),
+                # Cycle 33 : la temporalité d'une action reste un paramètre métier
+                # du classeur. Le moteur se contente de recopier le code de phase.
+                ("phase_action_override", "specific_action_phase"),
+            ):
+                value = clean(rule.get(col))
+                if value:
+                    res[target] = value
+            # Une règle documentaire peut exposer un ou plusieurs indicateurs génériques
+            # au moteur interblocs. Les noms de champs et leurs valeurs viennent entièrement
+            # d'Excel ; Python n'embarque aucune connaissance du bloc ni de la condition métier.
+            for field_col, value_col in (("champ_resultat", "valeur_resultat"),
+                                         ("champ_resultat_2", "valeur_resultat_2")):
+                result_field = clean(rule.get(field_col))
+                if not result_field:
+                    continue
+                result_value = clean(rule.get(value_col))
+                if isinstance(res.get(result_field), bool):
+                    result_value = result_value.lower() in {"oui", "yes", "true", "1"}
+                res[result_field] = result_value
+            if clean(rule.get("continuer_apres_match")).lower() not in {"oui", "yes", "true", "1"}:
+                break
 
-    # Exclusions explicites : elles priment sur la simple présence des termes 4D/5D.
-    exclusions_4d = "exclusions de principe" in all_text and "phasage 4d" in all_text
-    exclusions_5d = "exclusions de principe" in all_text and ("chiffrage 5d" in all_text or "5d contractuel" in all_text)
-    for bid, excluded, reason in (
-        ("B10", exclusions_4d, "Phasage 4D explicitement exclu de principe, sauf ordre écrit contraire."),
-        ("B12", exclusions_5d, "Chiffrage 5D explicitement exclu de principe, sauf ordre écrit contraire."),
-    ):
-        if excluded and bid in resultats:
-            r=resultats[bid]
-            r.update({"statut":"NON APPLICABLE", "certitude":"Fort", "applicabilite_lot":"NON_APPLICABLE", "conclusion":reason, "exclusion_explicit":True})
-            r["conv_pf"] = r["cctp_pf"] = ""
-            r["conv_pg"] = r["cctp_pg"] = ""
+        # Traçabilité finale des valeurs de contexte réellement présentes dans la
+        # restitution du bloc. Le contexte global provient de la Convention et
+        # porte, lorsqu'elle a été détectée, la page et l'extrait de chaque valeur.
+        # On n'ajoute une preuve complémentaire que si la valeur apparaît dans le
+        # texte final ET qu'aucune preuve déjà retenue sur cette page ne la trace.
+        # Ainsi une page image sans texte ne peut jamais fournir la valeur, et une
+        # occurrence lisible située sur une autre page reste correctement sourcée.
+        final_text = " ".join(clean(res.get(key)) for key in (
+            "specific_demand", "specific_response", "specific_action"
+        ) if clean(res.get(key)))
+        if final_text:
+            for ctx_key, ctx_value in sorted((ctx_global or {}).items()):
+                if ctx_key.endswith(("_page", "_extrait", "_source")):
+                    continue
+                value = clean(ctx_value)
+                if not value or not contains(final_text, value):
+                    continue
+                ctx_page = clean((ctx_global or {}).get(f"{ctx_key}_page"))
+                ctx_excerpt = clean((ctx_global or {}).get(f"{ctx_key}_extrait"))
+                if not ctx_page or not ctx_excerpt:
+                    continue
+                ctx_source_code = clean((ctx_global or {}).get(f"{ctx_key}_source")).upper() or "CONVENTION"
+                ctx_source_label = source_labels.get(ctx_source_code, ctx_source_code)
+                ctx_kind = "cctp" if ctx_source_code == "CCTP" else "convention"
+                def _kind_family(value: object) -> str:
+                    k = clean(value).casefold()
+                    if k in {"conv", "convention"}:
+                        return "convention"
+                    if k == "cctp":
+                        return "cctp"
+                    return k
+                value_norms = [norm(value)]
+                value_without_suffix = clean(re.sub(r"\s*\([^)]{1,24}\)\s*$", "", value))
+                if value_without_suffix and norm(value_without_suffix) not in value_norms:
+                    value_norms.append(norm(value_without_suffix))
 
-    # B09 : une clause CCTP nommant le profil BIM du lot et son niveau est directe.
-    if "B09" in resultats:
-        n=norm(cctp_text or "")
-        if "profil bim du lot" in n and "niveau bim" in n and any(k in n for k in ("facade", "bardage", "enveloppe")):
-            r=resultats["B09"]
-            r.update({"statut":"CONFIRMÉE", "certitude":"Fort", "presence_contractuelle":"CCTP", "applicabilite_lot":"APPLICABLE", "conclusion":"Obligation de collaboration BIM confirmée pour le lot analysé par le CCTP."})
-
-    # B07 : une plateforme commune de données est quasiment toujours nécessaire
-    # dès qu'un projet a des exigences BIM confirmées ailleurs -- elle ne doit
-    # pas dépendre de sa propre preuve indépendante dans le CCTP. Seule une
-    # exclusion explicite (déjà gérée par keywords_cctp_exclu, via le statut
-    # NON_APPLICABLE) doit l'écarter.
-    if "B07" in resultats:
-        r7 = resultats["B07"]
-        deja_exclu = r7.get("applicabilite_lot") == "NON_APPLICABLE"
-        deja_preuve = bool(r7.get("conv_pf") or r7.get("cctp_pf"))
-        if not deja_exclu and not deja_preuve:
-            autres_confirmes = sum(
-                1 for bid2, r2 in resultats.items()
-                if bid2 != "B07" and r2.get("statut") in ("CONFIRMÉE", "PROBABLE")
-            )
-            if autres_confirmes >= 2:
-                r7.update({
-                    "statut": "PROBABLE", "certitude": "Moyen",
-                    "presence_contractuelle": "PRESUMEE",
-                    "applicabilite_lot": "PROBABLE",
-                    "conclusion": (
-                        "Aucune plateforme n'est nommée explicitement, mais le projet comporte "
-                        "plusieurs exigences BIM confirmées : un environnement commun de données "
-                        "est présumé nécessaire, sauf indication contraire des documents."
-                    ),
+                already_traced = False
+                # Preuves principales déjà retenues. Une forme canonique peut
+                # comporter un acronyme entre parenthèses (ex. nom + sigle) alors
+                # que la clause source ne contient que le nom long : les deux
+                # formes sont donc comparées sans connaissance métier spécifique.
+                for proof_kind, proof_page, proof_text in (
+                    ("conv", clean(res.get("conv_pg")), clean(res.get("conv_pf"))),
+                    ("cctp", clean(res.get("cctp_pg")), clean(res.get("cctp_pf"))),
+                ):
+                    proof_norm = norm(proof_text)
+                    if _kind_family(proof_kind) == _kind_family(ctx_kind) and proof_page == ctx_page and any(v and v in proof_norm for v in value_norms):
+                        already_traced = True
+                        break
+                # Preuves complémentaires déjà ajoutées par les règles Excel.
+                if not already_traced:
+                    for extra in res.get("specific_evidence_extra") or []:
+                        if not isinstance(extra, dict):
+                            continue
+                        if _kind_family(extra.get("kind")) != _kind_family(ctx_kind):
+                            continue
+                        if clean(extra.get("page")) != ctx_page:
+                            continue
+                        extra_norm = norm(clean(extra.get("text")))
+                        if any(v and v in extra_norm for v in value_norms):
+                            already_traced = True
+                            break
+                if already_traced:
+                    continue
+                res.setdefault("specific_evidence_extra", []).append({
+                    "kind": ctx_kind,
+                    "source": ctx_source_label,
+                    "page": ctx_page,
+                    "text": ctx_excerpt,
                 })
-                r7["b07_defaut_applicable"] = True
 
-    # Recalcul final : statut actif impossible sans preuve affichable, hors B09 confirmé
-    # par la clause globale du CCTP et hors exclusions explicites.
-    for bid, r in resultats.items():
-        has_proof = bool(r.get("conv_pf") or r.get("cctp_pf"))
-        if r.get("exclusion_explicit"):
-            continue
-        if bid == "B09" and r.get("statut") == "CONFIRMÉE":
-            continue
-        if bid == "B07" and r.get("b07_defaut_applicable"):
-            continue
-        if r.get("statut") in ("CONFIRMÉE", "PROBABLE", "PARTIELLE") and not has_proof:
-            r.update({"statut":"NON DÉMONTRÉE", "certitude":"Faible", "presence_contractuelle":"ABSENTE", "applicabilite_lot":"A_CONFIRMER", "conclusion":"Aucune preuve suffisamment ciblée et applicable au lot n'a été retenue dans les documents analysés."})
 
-        # Source publique reconstruite uniquement depuis les preuves conservées.
-        if r.get("conv_pf") and r.get("cctp_pf"):
-            r["presence_contractuelle"]="CONVENTION_CCTP"
-        elif r.get("cctp_pf"):
-            r["presence_contractuelle"]="CCTP"
-        elif r.get("conv_pf"):
-            r["presence_contractuelle"]="CONVENTION"
-        elif r.get("statut") != "NON APPLICABLE":
-            r["presence_contractuelle"]="ABSENTE"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ÉVALUATION STATUT (MODULE LECTURE)
@@ -853,331 +1564,106 @@ def p_int(params: Dict[str, object], cle: str, defaut: int = 0) -> int:
     try: return int(v)
     except (TypeError, ValueError): return defaut
 
+def p_float(params: Dict[str, object], cle: str, defaut: float = 0.0) -> float:
+    v = params.get(cle, defaut)
+    try: return float(v)
+    except (TypeError, ValueError): return defaut
 
-def statut_legacy(presence: str, applicabilite: str) -> Tuple[str, str]:
-    """
-    Dérive un statut/certitude "historique" (CONFIRMÉE/PROBABLE/NON DÉMONTRÉE/
-    NON APPLICABLE) à partir des 3 axes, pour le tri, le regroupement en
-    sections et l'éligibilité au questionnaire -- sans perdre l'information
-    des 3 axes eux-mêmes, toujours disponibles séparément dans le résultat.
-    """
-    if applicabilite == "NON_APPLICABLE":
-        return "NON APPLICABLE", "Faible"
-    if presence == "ABSENTE":
-        return "NON DÉMONTRÉE", "Faible"
-    if applicabilite == "APPLICABLE":
-        return "CONFIRMÉE", "Fort"
-    if applicabilite == "PROBABLE":
-        return "PROBABLE", "Moyen"
-    return "PROBABLE", "Moyen"  # A_CONFIRMER
+
 
 
 def evaluate(bloc: pd.Series, cctp_text: str, lot: str,
              conv_text: str = "",
              signaux: Optional[pd.DataFrame] = None,
              params: Optional[Dict[str, object]] = None,
-             messages: Optional[Dict[str, str]] = None) -> Dict:
-    """
-    Évalue un bloc BIM selon 3 axes INDÉPENDANTS, plutôt qu'un statut unique
-    qui mélangeait présence contractuelle / applicabilité au lot / capacité
-    de l'entreprise :
-      - presence_contractuelle : ABSENTE / CONVENTION / CCTP / CONVENTION_CCTP
-      - applicabilite_lot      : APPLICABLE / PROBABLE / A_CONFIRMER / NON_APPLICABLE
-      - capacite_entreprise    : NON_EVALUEE (mise à jour ensuite par le questionnaire)
-    Tous les seuils/messages/codes viennent de l'Excel (05_Parametres_Moteur,
-    12_Messages_Moteur, 16_Axes_Config) -- aucun id_bloc codé en dur.
-    """
+             messages: Optional[Dict[str, str]] = None,
+             axes_config: Optional[Dict] = None) -> Dict:
+    """Évalue présence documentaire et applicabilité avec les seules règles Excel."""
     params = params or {}
     messages = messages or {}
-    titre        = clean(bloc.get("titre_bloc", ""))
-    bid_courant  = clean(bloc.get("id_bloc", ""))
-    kws_conf     = split_kw(bloc.get("keywords_cctp_confirme", ""))
-    kws_nu       = split_kw(bloc.get("keywords_cctp_nuance", ""))
-    kws_exclu    = split_kw(bloc.get("keywords_cctp_exclu", ""))
-    kws_conv     = split_kw(bloc.get("keywords_convention", ""))
-    kws_fort     = split_kw(bloc.get("keywords_preuve_forte", ""))
+    axes_config = axes_config or {}
+    titre = clean(bloc.get("titre_bloc", ""))
+    bid = clean(bloc.get("id_bloc", ""))
+    kws_conf = split_kw(bloc.get("keywords_cctp_confirme", ""))
+    kws_nu = split_kw(bloc.get("keywords_cctp_nuance", ""))
+    kws_exclu = split_kw(bloc.get("keywords_cctp_exclu", ""))
+    kws_conv = split_kw(bloc.get("keywords_convention", ""))
+    kws_fort = split_kw(bloc.get("keywords_preuve_forte", ""))
+    extra_conf, extra_fort = _kws_depuis_signaux(bid, signaux)
+    kws_conf += extra_conf
+    kws_fort += extra_fort
 
-    _extra_conf, _extra_fort = _kws_depuis_signaux(bid_courant, signaux)
-    kws_conf = kws_conf + _extra_conf
-    kws_fort = kws_fort + _extra_fort
-
-    has_cctp      = bool(cctp_text.strip())
-    has_conf_cctp = any_kw(cctp_text, kws_conf)
-    has_nu_cctp   = any_kw(cctp_text, kws_nu)
-    has_exclu_cctp= bool(kws_exclu and any_kw(cctp_text, kws_exclu))
-    has_fort_conv = any_kw(conv_text, kws_fort)
-    has_conf_conv = any_kw(conv_text, kws_conf + kws_fort)
+    has_cctp = bool(clean(cctp_text))
+    has_conf_cctp = any_kw_non_negated(cctp_text, kws_conf)
+    has_nu_cctp = any_kw_non_negated(cctp_text, kws_nu)
+    has_exclu_cctp = bool(kws_exclu and any_kw(cctp_text, kws_exclu))
+    has_fort_conv = any_kw_non_negated(conv_text, kws_fort)
+    has_conf_conv = any_kw_non_negated(conv_text, kws_conf + kws_fort)
     sc_conv = score_seg(conv_text, kws_conv, kws_fort) if conv_text else -999
-
-    # ═══ AXE 1 : PRÉSENCE CONTRACTUELLE ═══════════════════════════════════
-    # Existe-t-il une clause explicite (convention et/ou CCTP), indépendamment
-    # de savoir si elle s'applique à CE lot précis ?
-    seuil_conv = p_int(params, "seuil_presence_convention", 2)
+    seuil_conv = p_int(params, "seuil_presence_convention", 0)
     conv_explicite = has_fort_conv or has_conf_conv or sc_conv >= seuil_conv
     cctp_explicite = has_cctp and (has_conf_cctp or has_nu_cctp or has_exclu_cctp)
+
+    code_abs = p_text(params, "presence_code_absente")
+    code_conv = p_text(params, "presence_code_convention")
+    code_cctp = p_text(params, "presence_code_cctp")
+    code_both = p_text(params, "presence_code_convention_cctp")
     if conv_explicite and cctp_explicite:
-        presence, source = "CONVENTION_CCTP", "Convention + CCTP"
+        presence = code_both
     elif conv_explicite:
-        presence, source = "CONVENTION", "Convention"
+        presence = code_conv
     elif cctp_explicite:
-        presence, source = "CCTP", "CCTP"
+        presence = code_cctp
     else:
-        presence, source = "ABSENTE", "Aucune source explicite"
+        presence = code_abs
+    source = render_message(messages, f"source_presence_{presence}")
 
-    # ═══ AXE 2 : APPLICABILITÉ AU LOT ══════════════════════════════════════
-    # Cette exigence, si elle existe, concerne-t-elle CE lot précis ?
-    # Piloté par les défauts globaux de 05_Parametres_Moteur, jamais un id_bloc.
-    _raw_nuance = clean(bloc.get("statut_si_nuance_seul", "")).upper()
-    if presence == "ABSENTE":
-        applicabilite = p_text(params, "applicabilite_si_absence") or "A_CONFIRMER"
+    raw_nuance = clean(bloc.get("statut_si_nuance_seul", "")).upper()
+    valid_app = set((axes_config.get("applicabilite") or {}).keys())
+    if presence == code_abs:
+        applicabilite = p_text(params, "applicabilite_si_absence")
     elif has_exclu_cctp:
-        applicabilite = p_text(params, "applicabilite_si_cctp_exclu") or "NON_APPLICABLE"
-    elif has_conf_cctp and not has_nu_cctp:
-        applicabilite = p_text(params, "applicabilite_si_cctp_confirme") or "APPLICABLE"
+        applicabilite = p_text(params, "applicabilite_si_cctp_exclu")
+    elif has_conf_cctp:
+        applicabilite = p_text(params, "applicabilite_si_cctp_confirme")
     elif has_nu_cctp:
-        if _raw_nuance == "NON_APPLICABLE":
-            applicabilite = "NON_APPLICABLE"
-        elif _raw_nuance in ("NON_DEMONSTREE", "NON_DEMONTREE"):
-            applicabilite = "A_CONFIRMER"
-        else:
-            applicabilite = p_text(params, "applicabilite_si_cctp_nuance") or "PROBABLE"
+        applicabilite = raw_nuance if raw_nuance in valid_app else p_text(params, "applicabilite_si_cctp_nuance")
     elif has_cctp:
-        applicabilite = p_text(params, "applicabilite_si_silence_cctp") or "A_CONFIRMER"
+        applicabilite = p_text(params, "applicabilite_si_silence_cctp")
     else:
-        applicabilite = p_text(params, "applicabilite_sans_cctp") or "A_CONFIRMER"
+        applicabilite = p_text(params, "applicabilite_sans_cctp")
 
-    # ═══ Citation (mot-clé détecté, pour le message) ══════════════════════
     if has_exclu_cctp:
         kw = next((k for k in kws_exclu if contains(cctp_text, k)), "")
     elif has_conf_cctp:
-        kw = next((k for k in kws_conf if contains(cctp_text, k)), "")
+        kw = next((k for k in kws_conf if keyword_has_non_negated_occurrence(cctp_text, k)), "")
     elif has_nu_cctp:
-        kw = next((k for k in kws_nu if contains(cctp_text, k)), "")
+        kw = next((k for k in kws_nu if keyword_has_non_negated_occurrence(cctp_text, k)), "")
     elif has_conf_conv:
-        kw = next((k for k in (kws_fort + kws_conf) if contains(conv_text, k)), "")
+        kw = next((k for k in (kws_fort + kws_conf) if keyword_has_non_negated_occurrence(conv_text, k)), "")
     else:
         kw = ""
 
-    # ═══ Message de conclusion (paramétré, 12_Messages_Moteur) ════════════
     vals = {"titre": titre, "lot": lot, "source": source, "detection": kw}
-    if presence == "ABSENTE":
-        conclusion = render_message(messages, "conclusion_absente", **vals)
-    elif applicabilite == "APPLICABLE":
-        conclusion = render_message(messages, "conclusion_applicable", **vals)
-    elif applicabilite == "PROBABLE":
-        conclusion = render_message(messages, "conclusion_probable", **vals)
-    elif applicabilite == "NON_APPLICABLE":
-        conclusion = render_message(messages, "conclusion_non_applicable", **vals)
+    if presence == code_abs:
+        conclusion = render_message(messages, "conclusion_presence_ABSENTE", **vals)
     else:
-        conclusion = render_message(messages, "conclusion_a_confirmer", **vals)
-
+        conclusion = render_message(messages, f"conclusion_applicabilite_{applicabilite}", **vals)
     return {
         "presence_contractuelle": presence,
         "applicabilite_lot": applicabilite,
-        "capacite_entreprise": "NON_EVALUEE",
+        "capacite_entreprise": capacity_code_for_pct(axes_config, None),
         "conclusion": conclusion,
         "terme_detecte": kw,
+        "exclusion_explicit": bool(has_exclu_cctp),
     }
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# STYLES PDF — typographie identique au dashboard HTML
-# Correspondance px → pt : 1px ≈ 0.75pt (72pt/96px)
-# Dashboard body  13px → 9.75pt   | leading 1.6 → leading*1.6
-# ═══════════════════════════════════════════════════════════════════════════════
-# Correspondance exacte dashboard → PDF
-# body 13px/1.6            → Sm      9.5pt leading 15
-# titre 20px/400           → Title   15pt leading 20
-# KPI val 28px/700         → KPIVal  21pt bold
-# KPI label 10px/700 upper → Cap     7.5pt bold
-# section cap 8.5px/700    → SecCap  6.5pt bold
-# titre exig 12px/600      → H3      9pt bold
-# corps carte 11.5px       → Body    8.5pt leading 13.5
-# citation 10.5px italic   → Cit     7.8pt italic
-# tableau th 8px/700 upper → TH      6pt bold
-# tableau td 11px          → TD      8pt
-# bid bloc 10px/700        → BID     7.5pt bold
-# statut/diff 9.5px        → Sub     7pt
-# pied 9.5px               → Foot    7pt italic
-# ═══════════════════════════════════════════════════════════════════════════════
-def build_styles():
-    S = getSampleStyleSheet()
-    BLK  = colors.HexColor("#111111")
-    GRY  = colors.HexColor("#888888")
-    GRY6 = colors.HexColor("#666666")
-    GRY4 = colors.HexColor("#444444")
-    CIT  = colors.HexColor("#666666")
-
-    # (name, parent, fontSize, textColor, fontName, leading, spaceAfter, leftIndent)
-    defs = [
-        # Titre principal — 20px/400 → 15pt  (préfixe B_ pour éviter conflits ReportLab)
-        ("B_Title",   "Normal", 15,   BLK,  "Helvetica",        23, 4,  0),
-        # Sous-titre entête — 8.5px/color:#999
-        ("B_Sub",     "Normal",  6.5, colors.HexColor("#999999"), "Helvetica", 10, 2, 0),
-        # Section cap — 8.5px upper/700 → 6.5pt
-        ("B_Cap",     "Normal",  6.5, GRY,  "Helvetica-Bold",   10, 6,  0),
-        # KPI valeur — 28px/700 → 21pt
-        ("B_KPIVal",  "Normal", 21,   BLK,  "Helvetica-Bold",   24, 2,  0),
-        # Badges vigilance/maturité de l'en-tête -- plus petits que les 4 KPI
-        # principaux (cohérent avec le dashboard HTML : 17px vs 28px)
-        ("B_HdrBadge","Normal", 13,   BLK,  "Helvetica-Bold",   15, 2,  0),
-        # KPI label — 10px/700 upper → 7.5pt
-        ("B_KPILbl",  "Normal",  7.5, colors.HexColor("#aaaaaa"), "Helvetica", 11, 0, 0),
-        # Titre exigence (carte) — 12px/600 → 9pt bold
-        ("B_H3",      "Normal",  9,   BLK,  "Helvetica-Bold",   13, 2,  0),
-        # Corps carte — 11.5px → 8.5pt
-        ("B_Body",    "Normal",  8.5, GRY4, "Helvetica",        13, 2,  0),
-        # Corps neutre — 11px td → 8pt
-        ("B_TD",      "Normal",  8,   BLK,  "Helvetica",        12, 0,  0),
-        # Gras neutre
-        ("B_TDBold",  "Normal",  8,   BLK,  "Helvetica-Bold",   12, 0,  0),
-        # BID bloc — 10px/700 → 7.5pt bold
-        ("B_BID",     "Normal",  7.5, GRY,  "Helvetica-Bold",   11, 0,  0),
-        # Statut sous — 9.5px → 7pt
-        ("B_SubGry",  "Normal",  7,   colors.HexColor("#aaaaaa"), "Helvetica", 10, 0, 0),
-        # Citation — 10.5px italic → 7.8pt italic
-        ("B_Cit",     "Normal",  7.8, CIT,  "Helvetica-Oblique", 12, 0,  0),
-        # Référence citation — 8px
-        ("B_Ref",     "Normal",  6,   GRY,  "Helvetica-Oblique",  9, 2,  0),
-        # Badge statut — 7pt bold
-        ("B_Badge",   "Normal",  7,   BLK,  "Helvetica-Bold",   10, 0,  0),
-        # Pied de page — 9.5px → 7pt italic
-        ("B_Foot",    "Normal",  7,   GRY,  "Helvetica-Oblique", 10, 0,  0),
-        # Paragraphe réponse — 11.5px italic → 8.5pt
-        ("B_Rep",     "Normal",  8.5, GRY4, "Helvetica-Oblique", 13, 2,  8),
-        # Question BIM manager — 11.5px → 8pt
-        ("B_QBM",     "Normal",  8,   colors.HexColor("#555555"), "Helvetica", 12, 0, 0),
-        # Risque si ignoré — texte d'alerte
-        ("B_Risque",  "Normal",  8,   colors.HexColor("#7D0000"), "Helvetica", 12, 0, 0),
-    ]
-    for name, parent, fs, color, font, leading, sa, li in defs:
-        kw = dict(parent=S[parent], fontSize=fs, textColor=color,
-                  fontName=font, leading=leading, spaceAfter=sa, leftIndent=li)
-        S.add(ParagraphStyle(name=name, **kw))
-    return S
-
-def p(txt, sty): return Paragraph(html.escape(clean(str(txt))), sty)
-
-def hr_thick():
-    return HRFlowable(width="100%", thickness=2, color=colors.HexColor("#111111"),
-                      spaceAfter=0, spaceBefore=0)
-
-def hr_thin():
-    return HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#111111"),
-                      spaceAfter=0, spaceBefore=0)
-
-def hr_light():
-    return HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#cccccc"),
-                      spaceAfter=4, spaceBefore=4)
-
-# TableStyle de base — grille 0.5px #ccc, padding dashboard
-TS = [
-    ("GRID",         (0,0),(-1,-1), 0.5, colors.HexColor("#cccccc")),
-    ("VALIGN",       (0,0),(-1,-1), "TOP"),
-    ("LEFTPADDING",  (0,0),(-1,-1), 7),
-    ("RIGHTPADDING", (0,0),(-1,-1), 7),
-    ("TOPPADDING",   (0,0),(-1,-1), 5),
-    ("BOTTOMPADDING",(0,0),(-1,-1), 5),
-]
-
-# TableStyle pour en-tête th — fond #f5f5f5
-TS_TH = [
-    ("BACKGROUND",   (0,0),(-1,0), colors.HexColor("#f5f5f5")),
-    ("FONTNAME",     (0,0),(-1,0), "Helvetica-Bold"),
-    ("FONTSIZE",     (0,0),(-1,0), 6),
-    ("TEXTCOLOR",    (0,0),(-1,0), colors.HexColor("#666666")),
-]
-
-def mktbl(data, widths, hdr=True, ex=None):
-    t = Table(data, colWidths=widths, repeatRows=1 if hdr else 0)
-    ts = list(TS)
-    if hdr: ts += TS_TH
-    if ex:  ts += ex
-    t.setStyle(TableStyle(ts)); return t
 
 
 # =============================================================================
 # FILTRE GENERIQUE -- QUESTIONS BIM MANAGER
 # =============================================================================
-_STOP_MOTS = {
-    "le","la","les","un","une","des","du","de","est","il","y","a","au",
-    "pour","sur","quel","quelle","quels","quelles","qui","quoi","comment",
-    "combien","dans","avec","par","ce","cette","ces","votre","vous","nous",
-    "leur","leurs","son","sa","ses","si","ou","et","en","sont","ont",
-    "peut","doit","faut","sera","seront","devez","devra","pouvez",
-    "aussi","plus","meme","bien","tout","tous","toute","toutes","dont",
-}
 
-def filtrer_question_bm(question: str, conv_pf: str, cctp_pf: str,
-                         conv_text: str, lot: str) -> str:
-    """
-    Generique -- filtre les sous-QUESTIONS (phrases finissant par "?") dont
-    la reponse est deja dans les preuves documentaires (conv_pf, cctp_pf,
-    conv_text). Les phrases DECLARATIVES (finissant par ".") ne sont jamais
-    filtrees : ce sont des elements de contexte injectes via {variables}
-    (ex: "La plateforme detectee est {plateforme}.") qui recoupent forcement
-    le vocabulaire des documents -- les filtrer sur ce critere supprimerait
-    a tort le contexte utile, meme quand la question qui suit reste pertinente.
-    Remplace {lot} par le vrai nom du lot.
-    Retourne les phrases restantes, ou vide si tout est couvert.
-    """
-    if not question:
-        return ""
 
-    # Injecter le vrai lot
-    question = question.replace("{lot}", lot)
-
-    # Corpus documentaire
-    doc = (str(conv_pf) + " " + str(cctp_pf) + " " +
-           str(conv_text)[:4000]).lower()
-
-    # Decoupe en phrases sur ". " ou "? " -- mais jamais sur une abreviation
-    # du type "p." (page) suivie d'un nombre, pour ne pas casser les citations
-    # de page ("p.20 de la convention.") au milieu d'une phrase.
-    parties = [p.strip() for p in
-               re.split(r"(?<=[.?])\s+(?!\d)", question) if p.strip()]
-    if not parties:
-        parties = [question]
-
-    gardees = []
-    for sq in parties:
-        if not sq.endswith("?"):
-            # Phrase déclarative (contexte) : toujours conservée
-            gardees.append(sq)
-            continue
-        sq_propre = sq.rstrip("?").strip()
-        # Mots informatifs (longueur > 3, hors stop words)
-        mots = []
-        for m in sq_propre.split():
-            m_clean = m.lower().strip("?,.:;()!'\"")
-            if len(m_clean) > 3 and m_clean not in _STOP_MOTS:
-                mots.append(m_clean)
-        if not mots:
-            gardees.append(sq)
-            continue
-        # Ratio de couverture documentaire
-        n_couverts = sum(1 for m in mots if m in doc)
-        taux = n_couverts / len(mots)
-        # < 60% couverts -> question pertinente
-        if taux < 0.35:
-            gardees.append(sq if sq.endswith("?") else sq + "?")
-
-    return " ".join(gardees).strip()
-
-def _mots_cles_pour(detections: Optional[pd.DataFrame], cle_ctx: str) -> List[str]:
-    """
-    Retourne la liste des mots-clés (colonne mots_cles) de toutes les lignes
-    de 35_Detections_Convention portant ce cle_ctx, quel que soit le type.
-    Sert de lookup générique pour des listes utilitaires internes (ex:
-    libellés de colonnes de tableau à exclure), sans jamais coder ces
-    valeurs en dur dans le script.
-    """
-    if detections is None or detections.empty:
-        return []
-    out: List[str] = []
-    for _, row in detections.iterrows():
-        if clean(row.get("cle_ctx", "")) == cle_ctx:
-            out.extend(m.lower() for m in split_kw(row.get("mots_cles", "")))
-    return out
 
 
 def _extraction_metadata_generique(texte: str, regles: Optional[pd.DataFrame],
@@ -1225,106 +1711,741 @@ def _extraction_metadata_generique(texte: str, regles: Optional[pd.DataFrame],
         val = val.split("\n")[0].strip()
         if len(val) < 1 or val.lower() in exclusions:
             continue
-        res[champ] = val[:60].upper() if len(val) <= 3 else val[:60]
+        value_max = p_int(ENGINE_PARAMS_GLOBAL, f"metadata_{champ}_longueur_max", 0)
+        if not value_max:
+            value_max = p_int(ENGINE_PARAMS_GLOBAL, "metadata_valeur_longueur_max", len(val))
+        acronym_max = p_int(ENGINE_PARAMS_GLOBAL, "metadata_acronyme_longueur_max", 0)
+        clipped = val[:value_max] if value_max else val
+        res[champ] = clipped.upper() if acronym_max and len(val) <= acronym_max else clipped
     return res
+
+
+def detecter_points_vigilance_documentaires(conv_text: str, cctp_text: str, ccap_text: str,
+                                              documents_analyses: str, params: Dict[str, object],
+                                              messages: Dict[str, str],
+                                              qualite_documents: Optional[Dict[str, Dict[str, object]]] = None,
+                                              conv_pages: Optional[List[Tuple[int, str]]] = None,
+                                              cctp_pages: Optional[List[Tuple[int, str]]] = None,
+                                              ccap_pages: Optional[List[Tuple[int, str]]] = None,
+                                              additional_pages: Optional[List[Tuple[str, List[Tuple[int, str]]]]] = None,
+                                              ccap_hierarchy_pages: Optional[set[int]] = None,
+                                              document_rules: Optional[List[Dict[str, object]]] = None) -> List[Dict[str, str]]:
+    """Détecte des vigilances documentaires sans influer sur B01-B12.
+
+    Cycle 33 : chaque vigilance issue d'un contenu lisible conserve sa provenance
+    (document, page PDF et extrait). Les références de pièces sont nettoyées avant
+    comparaison afin de ne pas transformer une phrase entière en faux nom de
+    document. Le CCAP reste strictement informatif pour B01-B12.
+    """
+    out: List[Dict[str, str]] = []
+    excerpt_max = max(120, p_int(params, "vigilance_extrait_longueur_max", 360))
+
+    def _excerpt(page_text: str, start: int, end: int) -> str:
+        text = str(page_text or "")
+        if not text:
+            return ""
+        left = max(0, start - 180)
+        right = min(len(text), end + 260)
+        snippet = clean(text[left:right])
+        if len(snippet) > excerpt_max:
+            snippet = snippet[:max(0, excerpt_max - 3)].rstrip() + "..."
+        return snippet
+
+    # La qualité de lecture est une vigilance indépendante des blocs métier.
+    for role, quality in (qualite_documents or {}).items():
+        status = clean((quality or {}).get("statut", "")).upper()
+        if not status or status == "OK":
+            continue
+        role_up = clean(role).upper()
+        label = clean((quality or {}).get("label", "")) or role_up.title()
+        if status == "NON_EXPLOITABLE" and role_up == "CCTP":
+            out.append({
+                "type": "pdf_unreadable", "title": render_message(messages, "vigilance_cctp_unreadable_title"),
+                "text": render_message(messages, "vigilance_cctp_unreadable_text"),
+                "source": label, "page": "", "excerpt": "", "reference": "",
+            })
+        elif status == "NON_EXPLOITABLE" and role_up == "CCAP":
+            out.append({
+                "type": "pdf_unreadable", "title": render_message(messages, "vigilance_ccap_unreadable_title"),
+                "text": render_message(messages, "vigilance_ccap_unreadable_text"),
+                "source": label, "page": "", "excerpt": "", "reference": "",
+            })
+        elif status == "PARTIEL":
+            pages_scan = [int(x) for x in ((quality or {}).get("pages_images_non_lisibles", []) or [])]
+            page_field = ""
+            if pages_scan:
+                max_pages = max(1, p_int(params, "pdf_lecture_pages_signalees_max", 20))
+                shown = pages_scan[:max_pages]
+                pages_text = ", ".join(str(x) for x in shown)
+                if len(pages_scan) > len(shown):
+                    pages_text += f" (+{len(pages_scan) - len(shown)} autre(s))"
+                page_field = pages_text
+                detail = render_message(
+                    messages, "vigilance_pdf_partial_scan_text", document=label,
+                    pages_non_lisibles=pages_text, nombre_pages_non_lisibles=len(pages_scan),
+                    pages_lisibles=(quality or {}).get("pages_lisibles", 0),
+                    pages_total=(quality or {}).get("pages_total", 0),
+                )
+            else:
+                detail = render_message(
+                    messages, "vigilance_pdf_partial_text", document=label,
+                    pages_lisibles=(quality or {}).get("pages_lisibles", 0),
+                    pages_total=(quality or {}).get("pages_total", 0),
+                )
+            out.append({
+                "type": "pdf_partial", "title": render_message(messages, "vigilance_pdf_partial_title"),
+                "text": detail, "source": label, "page": page_field, "excerpt": "", "reference": "",
+            })
+
+    docs_norm = norm(documents_analyses or "")
+    pattern = p_text(params, "vigilance_reference_document_pattern")
+    bim_words = params.get("vigilance_reference_bim_mots", []) or []
+    if isinstance(bim_words, str):
+        bim_words = split_kw(bim_words)
+    stop_words = params.get("vigilance_reference_stop_words", []) or []
+    if isinstance(stop_words, str):
+        stop_words = split_kw(stop_words)
+    max_len = p_int(params, "vigilance_reference_longueur_max", 160)
+    min_tokens = max(1, p_int(params, "vigilance_reference_min_tokens", 2))
+    reject_fragments = params.get("vigilance_reference_reject_fragments", []) or []
+    if isinstance(reject_fragments, str):
+        reject_fragments = split_kw(reject_fragments)
+    citation_required_types = params.get("vigilance_reference_types_citation_obligatoire", []) or []
+    if isinstance(citation_required_types, str):
+        citation_required_types = split_kw(citation_required_types)
+    citation_required_types = {norm(x) for x in citation_required_types if clean(x)}
+    citation_markers = params.get("vigilance_reference_citation_markers", []) or []
+    if isinstance(citation_markers, str):
+        citation_markers = split_kw(citation_markers)
+    group_ignore_tokens = params.get("vigilance_reference_group_ignore_tokens", []) or []
+    if isinstance(group_ignore_tokens, str):
+        group_ignore_tokens = split_kw(group_ignore_tokens)
+    group_ignore_tokens = {norm(x) for x in group_ignore_tokens if clean(x)}
+
+    generic_tokens = {
+        "cahier", "charges", "annexe", "annexes", "guide", "notice", "charte", "protocole",
+        "document", "documents", "ses", "son", "sa", "leurs", "leur", "des", "les", "une", "un",
+        "avec", "pour", "dans", "sur", "par", "aux", "ainsi", "que", "et",
+    }
+
+    # Cycle 42 — taxonomie des références documentaires pilotée par Excel.
+    # Les lignes de 19_Regles_Documentaires dont famille_regle vaut
+    # VIGILANCE_TAXONOMIE classent une référence (pièce DCE, annexe, guide,
+    # norme, URL...) et indiquent si elle peut créer une vigilance. Le moteur
+    # ne connaît aucun nom de projet, lot, guide ou document particulier.
+    def _taxonomy_order(row: Dict[str, object]) -> int:
+        try:
+            return int(float(row.get("ordre", 9999)))
+        except (TypeError, ValueError):
+            return 9999
+
+    taxonomy_rules = [
+        row for row in (document_rules or [])
+        if clean(row.get("famille_regle")).upper() == "VIGILANCE_TAXONOMIE"
+        and clean(row.get("actif", "Oui")).lower() not in {"non", "false", "0"}
+    ]
+    taxonomy_rules.sort(key=_taxonomy_order)
+
+    def _taxonomy(reference: str) -> Dict[str, str]:
+        nref = norm(reference)
+        for row in taxonomy_rules:
+            pattern_tax = clean(row.get("vigilance_pattern"))
+            if not pattern_tax:
+                continue
+            try:
+                matched = re.search(pattern_tax, nref, flags=re.I)
+            except re.error:
+                matched = None
+            if not matched:
+                continue
+            return {
+                "nature": clean(row.get("vigilance_nature")),
+                "family": clean(row.get("vigilance_famille")),
+                "treatment": clean(row.get("vigilance_traitement")) or "VIGILANCE",
+                "citation_required": clean(row.get("vigilance_citation_obligatoire")),
+                "family_label": clean(row.get("vigilance_libelle_famille")),
+                "display_group": clean(row.get("vigilance_groupe_affichage")),
+                "display_order": clean(row.get("vigilance_ordre_affichage")),
+                "identity_note": clean(row.get("vigilance_notes_identite")),
+                "rule_id": clean(row.get("id_regle")),
+            }
+        return {
+            "nature": "", "family": "", "treatment": "VIGILANCE",
+            "citation_required": "", "family_label": "",
+            "display_group": "", "display_order": "",
+            "identity_note": "", "rule_id": "",
+        }
+
+    def _annexe_number(reference: str) -> str:
+        m = re.search(r"(?i)\bannexe(?:s)?\s*(?:n[°o]?\s*)?(\d{1,3})\b", norm(reference))
+        return m.group(1) if m else ""
+
+    def _clean_reference(raw: str) -> str:
+        ref = clean(raw)
+        if not ref:
+            return ""
+        # Si le titre de l'annexe est directement entre guillemets, le conserver.
+        mquoted = re.match(r"(?i)^(annexe(?:s)?)\s*[«\"]\s*([^»\"]{2,120})[»\"]", ref)
+        if mquoted:
+            ref = clean(f"{mquoted.group(1)} {mquoted.group(2)}")
+        else:
+            # Un sous-titre/tabulation cité après le nom principal ne crée pas un
+            # nouveau document : conserver le nom situé avant « : \"sous-rubrique\" ».
+            ref = re.split(r"\s*:\s*[«\"]", ref, maxsplit=1)[0]
+            ref = re.split(r"\s+[«\"]", ref, maxsplit=1)[0]
+        ref = re.sub(r"\b\d+\s*/\s*\d+\b", " ", ref)
+        # Une qualification placée entre parenthèses peut terminer le vrai titre ;
+        # si une proposition grammaticale recommence après « ), », elle appartient
+        # au contexte et non au nom de la pièce. Ce nettoyage est purement syntaxique.
+        ref = re.sub(
+            r"(\))\s*,\s+(?=(?:le|la|les|un|une|des|ce|cet|cette|ces)\b).*$",
+            r"\1", ref, flags=re.I,
+        )
+        # Couper au premier verbe/locution de phrase configuré dans Excel.
+        cut = len(ref)
+        for token in stop_words:
+            tok = clean(token)
+            if not tok:
+                continue
+            m = re.search(r"(?i)(?<!\w)" + re.escape(tok) + r"(?!\w)", ref)
+            if m and m.start() > 0:
+                cut = min(cut, m.start())
+        ref = clean(ref[:cut]).strip(" -–—:;,.")
+        if max_len:
+            ref = ref[:max_len].rstrip()
+        if not ref:
+            return ""
+        if any(contains(ref, fragment) for fragment in reject_fragments if clean(fragment)):
+            return ""
+        toks = [t for t in re.findall(r"[a-z0-9]+", norm(ref)) if len(t) >= 3]
+        significant = [t for t in toks if t not in generic_tokens]
+        # Une référence très générique sans contexte BIM ni titre significatif est rejetée.
+        has_bim_context = any(contains(ref, w) for w in bim_words) if bim_words else True
+        if not has_bim_context:
+            return ""
+        if len(significant) < min_tokens and not any(t in {"bim", "exe", "aim", "gmao"} for t in significant):
+            return ""
+        return ref
+
+    def _reference_type(reference: str) -> str:
+        nref = norm(reference)
+        if nref.startswith("cahier des charges"):
+            return "cahier des charges"
+        if nref.startswith("suivi de convention"):
+            return "suivi de convention"
+        parts = re.findall(r"[a-z0-9]+", nref)
+        return parts[0] if parts else ""
+
+    def _context_confirms_citation(page_text: str, start: int, end: int, reference: str) -> bool:
+        """Évite de confondre un livrable, un titre de section ou une activité
+        documentaire avec une pièce externe réellement citée.
+
+        Cycle 42 : la taxonomie Excel peut imposer ce contrôle à une famille
+        entière (ex. « Cahier des charges ») sans que Python connaisse le nom
+        de la pièce. Les paramètres historiques restent un repli compatible.
+        """
+        tax = _taxonomy(reference)
+        tax_required = clean(tax.get("citation_required")).lower()
+        if tax_required in {"oui", "yes", "true", "1"}:
+            required = True
+        elif tax_required in {"non", "no", "false", "0"}:
+            required = False
+        else:
+            required = _reference_type(reference) in citation_required_types
+        if not required:
+            return True
+        if not citation_markers:
+            return False
+        text = str(page_text or "")
+        # Se limiter à la ligne / puce contenant la référence : un marqueur situé
+        # dans la puce précédente ne doit pas transformer un livrable en citation.
+        left_candidates = [text.rfind(sep, 0, start) for sep in ("\n", "•", "▪", "\uf0b7")]
+        left = max([x for x in left_candidates if x >= 0], default=max(0, start - 120))
+        right_candidates = [text.find(sep, end) for sep in ("\n", "•", "▪", "\uf0b7")]
+        right_valid = [x for x in right_candidates if x >= 0]
+        right = min(right_valid) if right_valid else min(len(text), end + 120)
+        context = text[max(0, left):min(len(text), right)]
+        return any(contains(context, marker) for marker in citation_markers if clean(marker))
+
+    def _identity(reference: str) -> Tuple[str, set[str]]:
+        nref = norm(reference)
+        # Le préfixe « annexe » et un éventuel numéro ne distinguent pas le titre
+        # d'une pièce : ils restent affichés mais sont ignorés pour le regroupement.
+        core = re.sub(r"^(?:annexe(?:s)?\s*)?(?:n[°o]?\s*)?\d{1,3}\s*[-–—:]?\s*", "", nref).strip()
+        core = re.sub(r"^annexe(?:s)?\s+", "", core).strip()
+        tokens = [t for t in re.findall(r"[a-z0-9]+", core) if len(t) >= 3]
+        sig = {t for t in tokens if t not in generic_tokens and t not in group_ignore_tokens}
+        return core, sig
+
+    def _same_reference(a: str, b: str) -> bool:
+        ca, ta = _identity(a)
+        cb, tb = _identity(b)
+        taxa, taxb = _taxonomy(a), _taxonomy(b)
+        fa, fb = clean(taxa.get("family")), clean(taxb.get("family"))
+        # Deux familles explicitement différentes dans Excel ne sont jamais
+        # fusionnées uniquement parce qu'elles partagent des mots génériques.
+        if fa and fb and fa != fb:
+            return False
+        if ca and ca == cb:
+            return True
+        if len(ta) >= 2 and ta == tb:
+            return True
+        # Deux variantes d'une même annexe numérotée peuvent employer des
+        # sous-titres légèrement différents (affectation / codification...).
+        # On les réunit seulement si Excel les classe dans la même famille et
+        # qu'elles partagent au moins un terme sémantique significatif.
+        na, nb = _annexe_number(a), _annexe_number(b)
+        if na and nb and na == nb and fa and fa == fb and (ta & tb):
+            return True
+        # Variante qualifiée d'un même titre (ex. suffixe de rôle/phase ignoré
+        # par le paramétrage) : ne fusionner que si la famille documentaire est
+        # identique et qu'un intitulé est réellement le préfixe de l'autre.
+        if ta and ta == tb and _reference_type(a) == _reference_type(b) and (ca.startswith(cb) or cb.startswith(ca)):
+            return True
+        common = len(ta & tb)
+        union = len(ta | tb)
+        return bool(common >= 3 and union and (common / union) >= 0.75)
+
+    def _best_reference(refs: List[str]) -> str:
+        vals = [clean(x) for x in refs if clean(x)]
+        if not vals:
+            return ""
+        def score(value: str):
+            nv = norm(value)
+            starts_annexe = 1 if nv.startswith("annexe") else 0
+            return (starts_annexe, len(re.findall(r"[a-z0-9]+", nv)), len(value))
+        return min(vals, key=score)
+
+    def _locations(occurrences: List[Dict[str, str]]) -> str:
+        grouped: Dict[str, List[str]] = {}
+        order: List[str] = []
+        for occ in occurrences:
+            src = clean(occ.get("source")) or "Document"
+            pg = clean(occ.get("page"))
+            if src not in grouped:
+                grouped[src] = []
+                order.append(src)
+            if pg and pg not in grouped[src]:
+                grouped[src].append(pg)
+        parts = []
+        for src in order:
+            pages = grouped[src]
+            parts.append(src + ((" p." + ", ".join(pages)) if pages else ""))
+        return " ; ".join(parts)
+
+    def _merge_missing_references(items: List[Dict[str, object]]) -> List[Dict[str, object]]:
+        merged: List[Dict[str, object]] = []
+        for item in items:
+            if clean(item.get("type")) != "missing_reference":
+                merged.append(item)
+                continue
+            occurrence = {
+                "source": clean(item.get("source")),
+                "page": clean(item.get("page")),
+                "excerpt": clean(item.get("excerpt")),
+                "reference": clean(item.get("reference")),
+            }
+            target = next((x for x in merged if clean(x.get("type")) == "missing_reference"
+                           and _same_reference(clean(x.get("reference")), clean(item.get("reference")))), None)
+            if target is None:
+                clone = dict(item)
+                clone["occurrences"] = [occurrence]
+                merged.append(clone)
+                continue
+            occs = list(target.get("occurrences") or [])
+            occ_key = (norm(occurrence["source"]), occurrence["page"], norm(occurrence["reference"]))
+            known = {(norm(o.get("source")), clean(o.get("page")), norm(o.get("reference"))) for o in occs}
+            if occ_key not in known:
+                occs.append(occurrence)
+            target["occurrences"] = occs
+            target["reference"] = _best_reference([clean(target.get("reference")), clean(item.get("reference"))])
+
+        for item in merged:
+            if clean(item.get("type")) != "missing_reference":
+                continue
+            occs = list(item.get("occurrences") or [])
+            if not occs:
+                occs = [{
+                    "source": clean(item.get("source")), "page": clean(item.get("page")),
+                    "excerpt": clean(item.get("excerpt")), "reference": clean(item.get("reference")),
+                }]
+                item["occurrences"] = occs
+            sources = []
+            for occ in occs:
+                src = clean(occ.get("source"))
+                if src and src not in sources:
+                    sources.append(src)
+            item["source"] = sources[0] if len(sources) == 1 else " / ".join(sources)
+            if len(sources) == 1:
+                pages = []
+                for occ in occs:
+                    pg = clean(occ.get("page"))
+                    if pg and pg not in pages:
+                        pages.append(pg)
+                item["page"] = ", ".join(pages)
+            else:
+                item["page"] = ""
+            item["excerpt"] = clean(occs[0].get("excerpt")) if occs else ""
+            tax = _taxonomy(clean(item.get("reference")))
+            item["reference_nature"] = clean(tax.get("nature"))
+            item["reference_family"] = clean(tax.get("family"))
+            item["reference_family_label"] = clean(tax.get("family_label"))
+            item["reference_display_group"] = clean(tax.get("display_group"))
+            item["reference_display_order"] = clean(tax.get("display_order"))
+            item["reference_taxonomy_rule"] = clean(tax.get("rule_id"))
+            if len(occs) > 1:
+                item["text"] = render_message(
+                    messages, "vigilance_missing_doc_text_grouped",
+                    reference=clean(item.get("reference")), locations=_locations(occs),
+                )
+        return merged
+
+    def _refs(pages: Optional[List[Tuple[int, str]]], text: str, source: str):
+        if not pattern:
+            return
+        page_seq = list(pages or []) or [(0, text or "")]
+        vus = set()
+        for page_no, page_text in page_seq:
+            if not page_text:
+                continue
+            # Les PDF numériques coupent parfois un titre de pièce au milieu d'une
+            # ligne (ex. « ... et ses\nannexes »). Pour la seule détection des
+            # références documentaires, on ressoude uniquement les retours à la
+            # ligne qui ressemblent à un simple habillage typographique entre deux
+            # mots en minuscules. La longueur de la chaîne reste inchangée, donc les
+            # positions de l'extrait source restent fiables.
+            match_text = re.sub(
+                r"(?<=[a-zà-ÿ])[ \t]*\n[ \t]*(?=[a-zà-ÿ])",
+                lambda m: " " * len(m.group(0)),
+                page_text,
+            )
+            try:
+                matches = list(re.finditer(pattern, match_text))
+            except re.error:
+                return
+            for m in matches:
+                raw = clean(m.group(1) if m.lastindex else m.group(0))
+                ref = _clean_reference(raw)
+                if not ref:
+                    continue
+                tax = _taxonomy(ref)
+                if clean(tax.get("treatment")).upper() in {"EXCLURE", "IGNORE", "IGNORER"}:
+                    continue
+                if not _context_confirms_citation(page_text, m.start(), m.end(), ref):
+                    continue
+                key = norm(ref)[:120]
+                occurrence_key = (str(page_no or ""), key)
+                if not key or occurrence_key in vus:
+                    continue
+                vus.add(occurrence_key)
+                tokens = [t for t in re.findall(r"[a-z0-9]+", key) if len(t) >= 3]
+                # Les acronymes BIM/EXE/AIM/GMAO sont suffisamment discriminants
+                # même avec trois caractères. Les mots génériques de liaison ou de
+                # type documentaire ne doivent pas empêcher de reconnaître qu'une
+                # pièce ajoutée correspond à la référence signalée auparavant.
+                identity_tokens = [
+                    t for t in tokens
+                    if (t not in generic_tokens and len(t) >= 4) or t in {"bim", "exe", "aim", "gmao"}
+                ]
+                # Pour reconnaître qu'une pièce ajoutée correspond à une
+                # référence précédemment signalée, les deux premiers marqueurs
+                # discriminants suffisent (ex. « BIM EXE »). Exiger quatre mots
+                # faisait réapparaître le titre de la pièce comme une fausse
+                # référence manquante lorsque son en-tête contenait ensuite des
+                # mots descriptifs supplémentaires.
+                present = bool(identity_tokens) and all(t in docs_norm for t in identity_tokens[:2])
+                if present:
+                    continue
+                page_str = str(page_no) if page_no else "?"
+                text_msg = render_message(messages, "vigilance_missing_doc_text", reference=ref, source=source, page=page_str)
+                out.append({
+                    "type": "missing_reference",
+                    "title": render_message(messages, "vigilance_missing_doc_title"),
+                    "text": text_msg,
+                    "source": source,
+                    "page": page_str if page_no else "",
+                    "excerpt": _excerpt(page_text, m.start(), m.end()),
+                    "reference": ref,
+                    "reference_nature": clean(tax.get("nature")),
+                    "reference_family": clean(tax.get("family")),
+                    "reference_family_label": clean(tax.get("family_label")),
+                    "reference_display_group": clean(tax.get("display_group")),
+                    "reference_display_order": clean(tax.get("display_order")),
+                    "reference_taxonomy_rule": clean(tax.get("rule_id")),
+                })
+
+    _refs(conv_pages, conv_text or "", "Convention BIM")
+    _refs(cctp_pages, cctp_text or "", "CCTP")
+    for source_name, pages in (additional_pages or []):
+        _refs(pages, " ".join(text for _, text in (pages or [])), clean(source_name) or "Pièce complémentaire")
+
+    # Cycle 39 : une même pièce citée à plusieurs endroits ne doit produire
+    # qu'une seule vigilance. Toutes les occurrences restent tracées.
+    out = _merge_missing_references(out)
+
+    # CCAP : information documentaire uniquement. Regrouper les pages réelles et
+    # leurs extraits, en excluant les lignes typiques de table des matières.
+    ccap_pattern = re.compile(r"(?i)\bBIM\b|maquette\s+num[ée]rique|convention\s+BIM")
+    ccap_hits: Dict[int, List[str]] = {}
+    ccap_seq = list(ccap_pages or []) or ([(0, ccap_text)] if ccap_text else [])
+    for page_no, page_text in ccap_seq:
+        if not page_text:
+            continue
+        if int(page_no or 0) in (ccap_hierarchy_pages or set()):
+            substantive_on_hierarchy_page = bool(re.search(
+                r"(?i)maquette|\bIFC\b|\bDOE\b|\bCDE\b|plateforme|transmission[^.\n]{0,100}BIM|r[ée]union[^.\n]{0,100}BIM|[ée]l[ée]ments?\s+BIM",
+                page_text,
+            ))
+            if not substantive_on_hierarchy_page:
+                continue
+        for m in ccap_pattern.finditer(page_text):
+            snippet = _excerpt(page_text, m.start(), m.end())
+            if not snippet or re.search(r"\.{4,}", snippet):
+                continue
+            # Ne pas répéter dans les vigilances la simple ligne « Convention BIM »
+            # déjà affichée dans le repérage de hiérarchie contractuelle. Une clause
+            # BIM substantielle située sur la même page (maquette, IFC, DOE, CDE...)
+            # reste en revanche conservée.
+            if int(page_no or 0) in (ccap_hierarchy_pages or set()):
+                if contains(snippet, "convention BIM") and not any_kw_non_negated(
+                    snippet, ["maquette", "IFC", "DOE", "CDE", "plateforme", "données BIM", "donnees BIM"]
+                ):
+                    continue
+            pg = int(page_no or 0)
+            bucket = ccap_hits.setdefault(pg, [])
+            if snippet.casefold() not in {x.casefold() for x in bucket}:
+                bucket.append(snippet)
+    if ccap_hits:
+        max_pages = max(1, p_int(params, "vigilance_ccap_mentions_max", 10))
+        selected_pages = sorted(ccap_hits)[:max_pages]
+        page_text = ", ".join(str(p) for p in selected_pages if p)
+        excerpt_parts: List[str] = []
+        for pg in selected_pages:
+            for snippet in ccap_hits.get(pg, [])[:1]:
+                excerpt_parts.append((f"p.{pg} — " if pg else "") + snippet)
+        excerpt = clean(" | ".join(excerpt_parts))
+        if len(excerpt) > excerpt_max:
+            excerpt = excerpt[:max(0, excerpt_max - 3)].rstrip() + "..."
+        out.append({
+            "type": "ccap_info",
+            "title": render_message(messages, "vigilance_ccap_title"),
+            "text": render_message(messages, "vigilance_ccap_text"),
+            "source": "CCAP",
+            "page": page_text,
+            "excerpt": excerpt,
+            "reference": "",
+        })
+    return out
+
+
+
+def verifier_resolution_piece_ajoutee(reference: str, display_name: str,
+                                       pages: Optional[List[Tuple[int, str]]],
+                                       document_rules: Optional[List[Dict[str, object]]],
+                                       params: Dict[str, object]) -> bool:
+    """Vérifie qu'un PDF ajouté correspond réellement à la pièce ciblée.
+
+    Cycle 43 : le nom du fichier n'est jamais utilisé seul comme preuve d'identité.
+    La stratégie et les seuils sont lus dans les règles VIGILANCE_TAXONOMIE du
+    classeur Excel. Le manifeste d'ajout fournit la référence attendue, puis le
+    moteur contrôle sa compatibilité avec le titre/contenu des premières pages.
+    """
+    expected = clean(reference)
+    if not expected:
+        return False
+    nref = norm(expected)
+    matching_rule: Dict[str, object] = {}
+    rules = [
+        row for row in (document_rules or [])
+        if clean(row.get("famille_regle")).upper() == "VIGILANCE_TAXONOMIE"
+        and clean(row.get("actif", "Oui")).lower() not in {"non", "false", "0"}
+    ]
+    def _ord(row):
+        try:
+            return int(float(row.get("ordre", 9999)))
+        except (TypeError, ValueError):
+            return 9999
+    for row in sorted(rules, key=_ord):
+        pat = clean(row.get("vigilance_pattern"))
+        if not pat:
+            continue
+        try:
+            if re.search(pat, nref, flags=re.I):
+                matching_rule = row
+                break
+        except re.error:
+            continue
+    if not matching_rule:
+        return False
+    mode = clean(matching_rule.get("vigilance_resolution_mode")).upper()
+    if mode in {"", "NON_APPLICABLE", "EXCLURE", "IGNORE", "IGNORER"}:
+        return False
+    if mode != "MANIFESTE_CONTENU":
+        return False
+
+    pages_max = max(1, p_int(params, "vigilance_resolution_pages_max", 8))
+    content_parts = [clean(display_name)]
+    for _pg, txt in list(pages or [])[:pages_max]:
+        if clean(txt):
+            content_parts.append(clean(txt))
+    corpus = norm("\n".join(content_parts))
+    if not corpus:
+        return False
+
+    generic_raw = params.get("vigilance_resolution_mots_generiques", []) or []
+    generic = {norm(x) for x in (split_kw(generic_raw) if isinstance(generic_raw, str) else generic_raw) if clean(x)}
+    acr_raw = params.get("vigilance_resolution_acronymes_discriminants", []) or []
+    acronyms = {norm(x) for x in (split_kw(acr_raw) if isinstance(acr_raw, str) else acr_raw) if clean(x)}
+    tokens = [t for t in re.findall(r"[a-z0-9]+", nref) if len(t) >= 3]
+    significant = []
+    for token in tokens:
+        if token in acronyms or token not in generic:
+            if token not in significant:
+                significant.append(token)
+    if not significant:
+        return False
+
+    try:
+        min_tokens = max(1, int(float(matching_rule.get("vigilance_resolution_min_tokens") or 2)))
+    except (TypeError, ValueError):
+        min_tokens = 2
+    try:
+        ratio_min = float(matching_rule.get("vigilance_resolution_ratio_min") or 0.5)
+    except (TypeError, ValueError):
+        ratio_min = 0.5
+    matched = sum(1 for token in significant if re.search(r"(?<![a-z0-9])" + re.escape(token) + r"(?![a-z0-9])", corpus))
+    token_match = matched >= min_tokens and (matched / max(1, len(significant))) >= ratio_min
+
+    # Pour une annexe numérotée, le numéro est un marqueur d'identité très fort.
+    # Il complète le noyau lexical mais ne suffit jamais seul.
+    ann = re.search(r"\bannexe(?:s)?\s*(?:n[°o]?\s*)?(\d{1,3})\b", nref, flags=re.I)
+    if ann:
+        same_annex = bool(re.search(r"\bannexe(?:s)?\s*(?:n[°o]?\s*)?" + re.escape(ann.group(1)) + r"\b", corpus, flags=re.I))
+        return bool(same_annex and token_match)
+    return bool(token_match)
+
+def qualifier_vigilances_pour_ajout(points: List[Dict[str, object]], results: Dict[str, Dict],
+                                      params: Dict[str, object]) -> List[Dict[str, object]]:
+    """Marque uniquement les pièces manquantes reliées à un bloc encore incertain.
+
+    Le moteur ne décide pas qu'une annexe est « importante » par son nom. Il vérifie
+    si la référence documentaire est effectivement reprise dans le contenu public
+    d'un bloc dont le statut est paramétré comme réévaluable.
+    """
+    allowed_raw = params.get("vigilance_ajout_statuts", []) or []
+    allowed = {clean(x).upper() for x in (split_kw(allowed_raw) if isinstance(allowed_raw, str) else allowed_raw)}
+    sources_raw = params.get("vigilance_ajout_sources", []) or []
+    allowed_sources = {clean(x).upper() for x in (split_kw(sources_raw) if isinstance(sources_raw, str) else sources_raw)}
+    min_tokens = max(1, p_int(params, "vigilance_ajout_min_tokens", 2))
+    generic = {"cahier", "charges", "annexe", "annexes", "convention", "document", "documents", "bim"}
+    for point in points or []:
+        point["upload_recommended"] = False
+        point["related_blocks"] = []
+        if clean(point.get("type")) != "missing_reference":
+            continue
+        occurrences = list(point.get("occurrences") or [])
+        if not occurrences:
+            occurrences = [{
+                "source": clean(point.get("source")), "page": clean(point.get("page")),
+                "excerpt": clean(point.get("excerpt")), "reference": clean(point.get("reference")),
+            }]
+        eligible_occurrences = [
+            occ for occ in occurrences
+            if not allowed_sources or clean(occ.get("source")).upper() in allowed_sources
+        ]
+        if allowed_sources and not eligible_occurrences:
+            continue
+        reference = clean(point.get("reference"))
+        ref_norm = norm(reference)
+        ref_tokens = [t for t in re.findall(r"[a-z0-9]+", ref_norm) if len(t) >= 3 and t not in generic]
+        if not reference:
+            continue
+        related = []
+        for bid, res in results.items():
+            status = clean(res.get("public_status_key")).upper()
+            if allowed and status not in allowed:
+                continue
+            hay = " ".join(clean(res.get(k)) for k in (
+                "public_demand", "public_question", "conclusion", "conv_pf", "cctp_pf", "specific_demand"
+            ))
+            hay_norm = norm(hay)
+            exact = bool(ref_norm and ref_norm in hay_norm)
+            common = sum(1 for t in ref_tokens if t in hay_norm)
+            strong_overlap = bool(
+                len(ref_tokens) >= min_tokens
+                and common >= min_tokens
+                and (common / max(1, len(ref_tokens))) >= 0.7
+            )
+            if exact or strong_overlap:
+                related.append(clean(bid))
+        if related:
+            point["upload_recommended"] = True
+            point["related_blocks"] = related
+            primary = (eligible_occurrences or occurrences)[0]
+            point["upload_source"] = clean(primary.get("source"))
+            point["upload_page"] = clean(primary.get("page"))
+            point["upload_excerpt"] = clean(primary.get("excerpt"))
+    return points
+
+def appliquer_securite_cctp_non_lisible(results: Dict[str, Dict], qualite_cctp: Dict[str, object],
+                                           params: Dict[str, object], messages: Dict[str, str]) -> None:
+    """Empêche un CCTP image/non OCR de produire de faux "non démontré".
+
+    La règle est purement documentaire et générique : si le CCTP a été fourni
+    mais ne peut pas être lu, seuls les blocs déjà confirmés par une autre preuve
+    ou explicitement exclus conservent leur décision. Les autres passent dans un
+    état de clarification dont les codes sont configurés dans Excel.
+    """
+    if clean((qualite_cctp or {}).get("statut", "")).upper() != "NON_EXPLOITABLE":
+        return
+
+    code_applicable = p_text(params, "applicabilite_si_cctp_confirme")
+    code_non_applicable = p_text(params, "applicabilite_si_cctp_exclu")
+    safe_app = p_text(params, "pdf_cctp_applicabilite_non_lisible")
+    safe_status = p_text(params, "pdf_cctp_statut_public_non_lisible")
+    safe_decision = p_text(params, "pdf_cctp_decision_non_lisible")
+    safe_response = p_text(params, "pdf_cctp_response_mode_non_lisible")
+    safe_action = p_text(params, "pdf_cctp_action_mode_non_lisible")
+    safe_question = p_text(params, "pdf_cctp_question_mode_non_lisible")
+    safe_demand = render_message(messages, "pdf_cctp_unreadable_block_demand")
+
+    for result in (results or {}).values():
+        if bool(result.get("exclusion_explicit")) or bool(result.get("interblock_exclusion")):
+            continue
+        current_app = clean(result.get("applicabilite_lot", ""))
+        # Une exigence déjà applicable grâce à une preuve indépendante du CCTP
+        # reste confirmée. Une exclusion déjà démontrée reste également inchangée.
+        if current_app in {code_applicable, code_non_applicable}:
+            continue
+        if safe_app:
+            result["applicabilite_lot"] = safe_app
+        if safe_status:
+            result["statut_public_override"] = safe_status
+        if safe_decision:
+            result["decision_override"] = safe_decision
+        if safe_response:
+            result["response_mode_override"] = safe_response
+        if safe_action:
+            result["action_mode_override"] = safe_action
+        if safe_question:
+            result["question_mode_override"] = safe_question
+        if safe_demand:
+            result["specific_demand"] = safe_demand
 
 
 def _extraire_infos_document(pages_textes: list, detections: Optional[pd.DataFrame] = None,
                               metadata_rules: Optional[pd.DataFrame] = None) -> dict:
-    """
-    Extraction générique depuis n'importe quel PDF de convention/CCTP français.
-    Fonctionne avec ou sans page de garde structurée.
-    Les motifs de reconnaissance (indice/phase/date/émetteur/MOA/MOE/entreprise
-    générale/BIM Manager/Coordinateur BIM) viennent de 36_Extraction_Metadata --
-    seule la stratégie de repli pour le titre (heuristique générique : ligne la
-    plus longue et significative de la page 1) reste un algorithme en code,
-    faute de pouvoir exprimer "la ligne la plus longue" comme une regex simple.
-    """
-    champs = ["indice", "phase", "date", "emetteur", "maitre_ouvrage", "maitrise_oeuvre",
-              "entreprise_generale", "bim_manager", "coordinateur_bim", "numero_affaire"]
+    """Extrait les métadonnées uniquement avec les règles de 36_Extraction_Metadata."""
+    champs = [
+        "indice", "phase", "date", "emetteur", "maitre_ouvrage", "maitrise_oeuvre",
+        "entreprise_generale", "bim_manager", "coordinateur_bim", "numero_affaire", "operation", "nom_projet", "lot_cctp",
+    ]
     res = {"titre": "", **{c: "" for c in champs}}
     if not pages_textes:
         return res
-
     texte_global = "\n".join(pages_textes)
-    pg1 = pages_textes[0]
-    lignes_pg1 = [l.strip() for l in pg1.split("\n") if l.strip()]
-
-    extraits = _extraction_metadata_generique(texte_global, metadata_rules, champs)
-    res.update(extraits)
-
-    # ── Structure page de garde (repli générique) : émetteur = première ligne
-    # significative après un label "Bureau d'études"/"Maîtrise d'œuvre", si le
-    # moteur générique n'a rien trouvé pour l'émetteur.
-    if not res["emetteur"]:
-        for i, l in enumerate(lignes_pg1):
-            if re.match(r"bureau\s+d['\u2019]?\s*[eé]tudes?|"
-                        r"ma[iî]tr(?:e|ise)\s+d['\u2019]?\s*(?:oeuvre|œuvre)", l, re.I):
-                for s in lignes_pg1[i+1:i+8]:
-                    s = s.strip("_").strip("-").strip()
-                    # Exclure adresses, tirets, codes postaux, MO déjà trouvé
-                    if (len(s) > 3 and
-                        not re.match(r"^\d+\s+(?:impasse|rue|avenue|bd)", s, re.I) and
-                        not re.match(r"^[\-_\s]+$", s) and
-                        not re.match(r"^\d{4,5}\s", s) and
-                        "cedex" not in s.lower() and
-                        (not res["maitre_ouvrage"] or
-                         s.lower() != res["maitre_ouvrage"].lower()) and
-                        not re.match(r"ma[iî]tre?\s+d", s, re.I)):
-                        res["emetteur"] = s[:60]
-                        break
-                break
-    # MO depuis structure
-    if not res["maitre_ouvrage"]:
-        for i, l in enumerate(lignes_pg1):
-            if re.match(r"ma[iî]tre?\s+d['\u2019]?\s*ouvrage", l, re.I):
-                for s in lignes_pg1[i+1:i+5]:
-                    s = s.strip()
-                    if len(s) > 2 and not re.match(r"^[\-_]+$", s):
-                        res["maitre_ouvrage"] = s[:60]; break
-                break
-
-    # ── 5. En-têtes pages 2-4 — numéro d'affaire + indice uniquement ────
-    # NE PAS chercher l'émetteur ici : les en-têtes répétés contiennent
-    # le nom du client/projet, pas l'émetteur → source de faux positifs.
-    # Si la page 1 n'a pas d'émetteur lisible (logo image), rester vide.
-    for pg in pages_textes[1:4]:
-        entete = pg[:300]
-        if not res["numero_affaire"]:
-            m_n = re.search(r"N[°o\.] *:? *([\.\.\d\-]{4,15})", entete)
-            if m_n: res["numero_affaire"] = m_n.group(1)
-        # Indice — pattern strict "Indice : B" uniquement (pas "DCE-B" free-text)
-        if not res["indice"]:
-            m_i = re.search(r"Indice\s*:?\s*([A-E])\b", entete, re.IGNORECASE)
-            if m_i: res["indice"] = m_i.group(1).upper()
-
-
-    # ── 6. Titre ─────────────────────────────────────────────────────
-    # Mots typiques de titres de chapitres BIM qui ne sont PAS des titres de document
-    _mots_chapitre = (
-        "codification", "nomenclature", "classification", "processus",
-        "exigences", "livrables", "réunion", "compte rendu",
-        "organisation", "responsabilités", "protocole", "procédure",
-        "sommaire", "table des", "annexe", "glossaire", "définition"
-    )
-    def _ok(l):
-        ll = l.lower()
-        return (len(l) > 12 and
-                not re.match(r"^[\d\s\-\./,_°]+$", l) and
-                not re.match(r"^\d+\s+(?:impasse|rue|avenue|boulevard)", l, re.I) and
-                "cedex" not in ll and "@" not in l and
-                not re.match(
-                    r"^(?:phase|indice|date|objet|version|rédacteur|relecture|"
-                    r"bureau|maitre|ma[iî]tre|émetteur|établi|rédigé|auteur|"
-                    r"n°|ref\.|réf\.|page)", l, re.I) and
-                not re.search(
-                    r"(?:ESQ|APS|APD|PRO|DCE|EXE|DOE)\s+[A-E]\s+\d{1,2}\s+\w+\s+\d{4}", l, re.I) and
-                # Exclure titres de chapitres typiques BIM
-                not any(mot in ll for mot in _mots_chapitre))
-    cands = [l for l in lignes_pg1[:30] if _ok(l)]
-    if cands:
-        res["titre"] = max(cands, key=len)[:80]
-
+    res.update(_extraction_metadata_generique(texte_global, metadata_rules, champs))
+    res["titre"] = clean(res.get("operation", ""))
     return res
 
 
@@ -1354,8 +2475,9 @@ def _localiser_page(pages: Optional[List[Tuple[int, str]]], variants: List[str])
                     i, kw_matched = j, kw
             if i == -1:
                 break
-            start = max(0, i - 60)
-            extrait = txt[start:i + len(kw_matched) + 60].strip()
+            context_chars = p_int(ENGINE_PARAMS_GLOBAL, "localisation_contexte_caracteres", 0)
+            start = max(0, i - context_chars)
+            extrait = txt[start:i + len(kw_matched) + context_chars].strip()
             if re.search(r"\.{4,}", extrait):  # ligne de sommaire (points de suite)
                 pos = i + len(kw_matched)
                 continue
@@ -1436,6 +2558,38 @@ def _appliquer_detections(ctx: Dict, txt: str, conv_pages, detections: Optional[
         ctx[cle] = ", ".join(valeurs)
 
 
+
+def _fusionner_formats_declares(formats_existants: str, liste_brute: str, format_ifc: str = "") -> str:
+    """Ajoute les formats explicitement listés mais absents du référentiel nominatif.
+
+    Le moteur ne devine pas des formats dans la prose : ce repli ne travaille que
+    sur une liste déjà capturée par une règle Excel de 36_Extraction_Metadata.
+    Les jetons sont dédoublonnés sans connaître de format métier particulier.
+    Les variantes IFC restent exposées dans le champ dédié ``format_ifc``.
+    """
+    existants = [clean(v) for v in str(formats_existants or "").split(",") if clean(v)]
+    if not liste_brute:
+        return ", ".join(existants)
+    texte = re.sub(r"(?i)\b(?:et|and)\b", ";", str(liste_brute))
+    candidats = [clean(v).strip(" .") for v in re.split(r"[,;]", texte)]
+    vus = {norm(v) for v in existants}
+    for brut in candidats:
+        if not brut:
+            continue
+        # Une liste de formats doit contenir des jetons courts (extension, sigle
+        # ou forme composée XLS/XLSX), pas une phrase libre.
+        if not re.fullmatch(r"\.?[A-Za-z0-9][A-Za-z0-9._+\-/]{0,19}", brut):
+            continue
+        valeur = brut.lstrip(".").upper()
+        if valeur.startswith("IFC") and format_ifc:
+            continue
+        cle = norm(valeur)
+        if cle not in vus:
+            existants.append(valeur)
+            vus.add(cle)
+    return ", ".join(existants)
+
+
 def _extraire_details_convention(bid: str, conv_pf: str, conv_pg: str,
                                   cctp_pf: str, cctp_pg: str,
                                   conv_text: str, lot: str,
@@ -1443,240 +2597,106 @@ def _extraire_details_convention(bid: str, conv_pf: str, conv_pg: str,
                                   gloss: Optional[pd.DataFrame] = None,
                                   detections: Optional[pd.DataFrame] = None,
                                   metadata_rules: Optional[pd.DataFrame] = None) -> Dict:
-    """Extrait les détails contextuels détectés dans les documents pour un bloc."""
+    """Construit le contexte à partir des seules tables de paramétrage Excel."""
     ctx: Dict = {
-        "plateforme": "",
-        "plateforme_page": "",
-        "plateforme_extrait": "",
-        "cout_plateforme": "",
-        "logiciel": "",
-        "logiciel_page": "", "logiciel_extrait": "",
-        "format_ifc": "",
-        "format_ifc_page": "", "format_ifc_extrait": "",
-        "lod": "",
-        "lod_page": "", "lod_extrait": "",
-        "nd": "",
-        "nd_page": "", "nd_extrait": "",
-        "frequence": "",
-        "section_cctp": "",
-        "niveau_bim": "",
-        "niveau_bim_page": "", "niveau_bim_extrait": "",
-        "dim_4d": False,
-        "dim_5d": False,
-        "dim_6d": False,
-        "dim_7d": False,
-        "bim_manager": "",
-        "bim_manager_page": "", "bim_manager_extrait": "",
-        "coordinateur_bim": "",
-        "coordinateur_bim_page": "", "coordinateur_bim_extrait": "",
-        "geo_referencement": False,
-        "clash_3d": False,
-        "doe_numerique": False,
-        "formats_livrables": "",
-        "contractuel": False,
-        "indice_doc": "",
-        "date_doc": "",
-        "emetteur_doc": "",
-        "maitre_ouvrage_doc": "",
-        "numero_affaire": "",
-        "titre_doc": "",
-        "conv_extrait": conv_pf[:200] if conv_pf else "",
-        "conv_page": conv_pg,
-        "cctp_extrait": cctp_pf[:200] if cctp_pf else "",
-        "cctp_page": cctp_pg,
+        "plateforme": "", "plateforme_page": "", "plateforme_extrait": "",
+        "cout_plateforme": "", "logiciel": "", "logiciel_page": "", "logiciel_extrait": "",
+        "format_ifc": "", "format_ifc_page": "", "format_ifc_extrait": "",
+        "lod": "", "lod_page": "", "lod_extrait": "", "nd": "", "nd_page": "", "nd_extrait": "",
+        "frequence": "", "section_cctp": "", "niveau_bim": "", "niveau_bim_page": "", "niveau_bim_extrait": "",
+        "dim_4d": False, "dim_5d": False, "dim_6d": False, "dim_7d": False,
+        "bim_manager": "", "bim_manager_page": "", "bim_manager_extrait": "",
+        "coordinateur_bim": "", "coordinateur_bim_page": "", "coordinateur_bim_extrait": "",
+        "geo_referencement": False, "clash_3d": False, "doe_numerique": False,
+        "formats_livrables": "", "contractuel": False, "indice_doc": "", "date_doc": "",
+        "emetteur_doc": "", "maitre_ouvrage_doc": "", "numero_affaire": "", "titre_doc": "",
+        "conv_extrait": conv_pf[:p_int(ENGINE_PARAMS_GLOBAL, "contexte_bloc_extrait_longueur_max", len(conv_pf))] if conv_pf else "", "conv_page": conv_pg,
+        "cctp_extrait": cctp_pf[:p_int(ENGINE_PARAMS_GLOBAL, "contexte_bloc_extrait_longueur_max", len(cctp_pf))] if cctp_pf else "", "cctp_page": cctp_pg,
     }
     txt = conv_text.lower()
-    # Plateforme CDE — liste construite dynamiquement depuis 40_Glossaire
-    # (lignes categorie == "Plateforme CDE"), plus un repli générique
-    # ("ECC", "environnement commun de données"...) si aucune marque précise
-    # n'est nommée. Ajouter une plateforme = une ligne dans l'Excel, jamais
-    # de modification de code.
+
+    # Les solutions CDE nommées viennent de 40_Glossaire ; les replis génériques,
+    # logiciels, formats, LOD/ND/niveaux et autres signaux viennent de 35_Detections_Convention.
+    plateforme_depuis_glossaire = False
     for variantes, nom_affichage in _plateformes_depuis_glossaire(gloss):
         matched = next((v for v in variantes if contains(txt, v)), None)
         if matched:
             ctx["plateforme"] = nom_affichage
             ctx["plateforme_page"], ctx["plateforme_extrait"] = _localiser_page(conv_pages, [matched])
+            plateforme_depuis_glossaire = True
             break
-    if not ctx["plateforme"]:
-        for p in ["ecc", "environnement commun de données", "environnement de collaboration"]:
-            if contains(txt, p):
-                # "CDE" / "ECC" sont des noms GÉNÉRIQUES (le type de plateforme), pas le nom
-                # d'une solution précise (KROQI, ACC, ProjectWise...). Ne jamais les afficher
-                # comme si c'était le nom de la plateforme détectée -- cela produit des phrases
-                # absurdes ("la plateforme CDE détectée est CDE"). On l'indique explicitement
-                # comme non nommée.
-                nom = "un CDE (Environnement Commun de Données), sans nom de solution précisé"
-                ctx["plateforme"] = nom
-                ctx["plateforme_page"], ctx["plateforme_extrait"] = _localiser_page(conv_pages, [p])
-                break
-    if not ctx["plateforme"] and any(contains(txt, k) for k in
-            ["plateforme d'échange", "plateforme collaborative", "une plateforme",
-             "espace dédié pour chaque intervenant", "plateforme de collaboration"]):
-        ctx["plateforme"] = "la plateforme collaborative du projet"
-        ctx["plateforme_page"], ctx["plateforme_extrait"] = _localiser_page(conv_pages,
-            ["plateforme d'échange", "plateforme collaborative", "plateforme de collaboration"])
-    # Coût plateforme
-    m = re.search(r"(\d{2,4})\s*€\s*(?:par|/)\s*corps", txt)
-    if m: ctx["cout_plateforme"] = m.group(1) + " €"
-    # Logiciel BIM, fréquence, géoréférencement, clash 3D, DOE numérique,
-    # dimensions 4D-7D, caractère contractuel, formats livrables -- tout
-    # piloté depuis 35_Detections_Convention (Excel), aucune liste en dur.
     _appliquer_detections(ctx, txt, conv_pages, detections)
-    # Format IFC
-    m2 = re.search(r"ifc\s*2x3|ifc\s*4|ifc4|ifc2x3", txt)
-    if m2:
-        ctx["format_ifc"] = m2.group(0).upper().replace(" ","")
-        ctx["format_ifc_page"], ctx["format_ifc_extrait"] = _localiser_page(conv_pages, [m2.group(0)])
-    # LOD / ND
-    m3 = re.search(r"lod\s*(\d{3})", txt)
-    if m3:
-        ctx["lod"] = "LOD " + m3.group(1)
-        ctx["lod_page"], ctx["lod_extrait"] = _localiser_page(conv_pages, [m3.group(0)])
-    mnd = re.search(r"nd\s*([3-5])", txt)
-    if mnd:
-        ctx["nd"] = "ND" + mnd.group(1)
-        ctx["nd_page"], ctx["nd_extrait"] = _localiser_page(conv_pages, [mnd.group(0)])
-    # Niveau BIM — regex générique, insensible à l'ordre des mots (« Niveau BIM 3 »
-    # ou « BIM Niveau 3 ») et à la casse
-    m_niv = re.search(r"(?:bim\s+)?niveau\s*(?:bim\s*)?([1-3])(?:\s+bim)?", txt, re.IGNORECASE)
-    if m_niv:
-        ctx["niveau_bim"] = "NIVEAU " + m_niv.group(1)
-        ctx["niveau_bim_page"], ctx["niveau_bim_extrait"] = _localiser_page(conv_pages, [m_niv.group(0).lower()])
-    # BIM Manager / Coordinateur BIM -- délégué au même moteur générique que
-    # _extraire_infos_document() (règles dans 36_Extraction_Metadata), pour
-    # ne jamais dupliquer les mêmes motifs à deux endroits du code.
-    _bm_cb = _extraction_metadata_generique(conv_text, metadata_rules, ["bim_manager", "coordinateur_bim"])
-    if _bm_cb.get("bim_manager"):
-        ctx["bim_manager"] = _bm_cb["bim_manager"]
-        ctx["bim_manager_page"], ctx["bim_manager_extrait"] = _localiser_page(conv_pages, [_bm_cb["bim_manager"].lower()])
-    if _bm_cb.get("coordinateur_bim"):
-        ctx["coordinateur_bim"] = _bm_cb["coordinateur_bim"]
-        ctx["coordinateur_bim_page"], ctx["coordinateur_bim_extrait"] = _localiser_page(conv_pages, [_bm_cb["coordinateur_bim"].lower()])
-    # Section CCTP
-    m4 = re.search(r"§\s*(\d+[\.\d]*)", cctp_pf or "")
-    if m4: ctx["section_cctp"] = "§" + m4.group(1)
 
-    # Note : les métadonnées de page de garde (indice, date, émetteur) sont extraites
-    # depuis les pages brutes fitz dans main() via _conv_infos / _cctp_infos.
-    # Cette fonction gère uniquement les détections dynamiques (plateforme, LOD, etc.)
+    # Les extractions regex sont elles aussi configurées dans 36_Extraction_Metadata.
+    # Les quatre champs de repli ci-dessous permettent de signaler une valeur
+    # explicitement nommée mais absente des listes nominatives de l'Excel.
+    extra = _extraction_metadata_generique(
+        conv_text, metadata_rules,
+        ["cout_plateforme", "bim_manager", "coordinateur_bim",
+         "plateforme", "logiciel", "formats_livrables_raw", "format_ifc"]
+    )
+    for key in ("cout_plateforme", "bim_manager", "coordinateur_bim"):
+        value = clean(extra.get(key, ""))
+        if value:
+            ctx[key] = value
+            if key in {"bim_manager", "coordinateur_bim"}:
+                pg, excerpt = _localiser_page(conv_pages, [value.lower()])
+                ctx[f"{key}_page"] = pg
+                ctx[f"{key}_extrait"] = excerpt
+
+    # Une plateforme explicitement nommée prime sur le repli générique
+    # « plateforme collaborative du projet », mais pas sur une plateforme déjà
+    # identifiée par le glossaire (qui apporte son libellé canonique).
+    plateforme_extra = clean(extra.get("plateforme", ""))
+    if plateforme_extra and not plateforme_depuis_glossaire:
+        ctx["plateforme"] = plateforme_extra
+        ctx["plateforme_page"], ctx["plateforme_extrait"] = _localiser_page(
+            conv_pages, [plateforme_extra.lower()]
+        )
+
+    logiciel_extra = clean(extra.get("logiciel", ""))
+    if logiciel_extra:
+        ctx["logiciel"] = logiciel_extra
+        ctx["logiciel_page"], ctx["logiciel_extrait"] = _localiser_page(
+            conv_pages, [logiciel_extra.lower()]
+        )
+
+    format_ifc_extra = clean(extra.get("format_ifc", ""))
+    if format_ifc_extra:
+        format_ifc_actuel = clean(ctx.get("format_ifc", ""))
+        compact_extra = re.sub(r"[^a-z0-9]", "", norm(format_ifc_extra))
+        compact_actuel = re.sub(r"[^a-z0-9]", "", norm(format_ifc_actuel))
+        # Le motif générique ne remplace une valeur déjà connue que s'il est
+        # strictement plus précis (ex. IFC 4.3 au lieu du match partiel IFC4).
+        plus_precis = bool(compact_actuel and compact_extra.startswith(compact_actuel)
+                           and len(compact_extra) > len(compact_actuel))
+        if not format_ifc_actuel or plus_precis:
+            ctx["format_ifc"] = format_ifc_extra
+            ctx["format_ifc_page"], ctx["format_ifc_extrait"] = _localiser_page(
+                conv_pages, [format_ifc_extra.lower()]
+            )
+
+    ctx["formats_livrables"] = _fusionner_formats_declares(
+        ctx.get("formats_livrables", ""),
+        clean(extra.get("formats_livrables_raw", "")),
+        ctx.get("format_ifc", ""),
+    )
+
+    if cctp_pf:
+        sec = _extraction_metadata_generique(cctp_pf, metadata_rules, ["section_cctp"])
+        if sec.get("section_cctp"):
+            ctx["section_cctp"] = sec["section_cctp"]
     return ctx
 
 
-def _questions_programmatiques(bid: str, titre: str, statut: str,
-                                ctx: Dict, lot: str) -> List[Dict]:
-    """
-    Génère 2 questions génériques contextualisées à partir des éléments
-    réellement détectés dans les documents (ctx), SANS AUCUNE dépendance à
-    un identifiant de bloc précis (bid). Fonctionne pour n'importe quel bloc
-    défini dans 10_Blocs -- y compris un bloc ajouté ou renommé ultérieurement.
-
-    Utilisée uniquement en dernier recours : si 50_Questions (Excel) ne
-    contient aucune question pour ce bloc, et si le mode API n'est pas
-    utilisé ou a échoué. La source de vérité pour des questions précises
-    et métier reste la feuille 50_Questions -- c'est là qu'il faut enrichir
-    le questionnaire, pas dans le code.
-    """
-    ref = f"p. {ctx['conv_page']}" if ctx.get("conv_page") else "dans la convention"
-    extrait = clean(ctx.get("conv_extrait") or ctx.get("cctp_extrait") or "")
-    detail = (f" La documentation précise : « {extrait[:140]}"
-              f"{'…' if len(extrait) > 140 else ''} » ({ref})." if extrait else "")
-
-    # Éléments techniques génériques détectés (aucun lien avec un bloc précis) :
-    # on les mentionne s'ils existent, sans jamais présumer lesquels s'appliquent.
-    elements = []
-    if ctx.get("plateforme"):  elements.append(f"la plateforme {ctx['plateforme']}")
-    if ctx.get("logiciel"):    elements.append(f"le logiciel {ctx['logiciel']}")
-    if ctx.get("format_ifc"):  elements.append(f"le format {ctx['format_ifc']}")
-    if ctx.get("lod"):         elements.append(f"le {ctx['lod']}")
-    contexte_tech = f" Cela peut impliquer notamment {', '.join(elements)}." if elements else ""
-
-    qs: List[Dict] = [
-        {
-            "question": (
-                f"L'exigence « {titre} » a été détectée ({statut.lower()}) "
-                f"pour le lot {lot}.{detail}{contexte_tech} "
-                f"Disposez-vous des compétences, outils ou ressources internes "
-                f"pour y répondre ?"
-            ),
-            "indice_0": "Non. Nous n'avons pas les ressources ou l'expérience pour cette exigence.",
-            "indice_1": "Partiellement. Nous pouvons répondre avec un accompagnement extérieur ou une montée en compétence.",
-            "indice_2": "Oui. Nous maîtrisons cette exigence et pouvons y répondre sans aide extérieure.",
-            "poids": 2,
-        },
-        {
-            "question": (
-                f"Pouvez-vous désigner dès maintenant une personne responsable "
-                f"du suivi de cette exigence pour le lot {lot} ?"
-            ),
-            "indice_0": "Non. Personne n'est identifié pour cette tâche.",
-            "indice_1": "Partiellement. Une personne pourrait le faire mais n'est pas encore formée.",
-            "indice_2": "Oui. Un responsable est identifié et opérationnel immédiatement.",
-            "poids": 1,
-        },
-    ]
-    return qs
 
 
 
-def _questions_via_api(bid: str, titre: str, statut: str, ctx: Dict,
-                        lot: str, api_key: str) -> Optional[List[Dict]]:
-    """
-    Génère des questions via l'API Anthropic (mode enrichi optionnel).
-    Retourne None si l'appel échoue → fallback programmatique.
-    """
-    try:
-        import urllib.request, json as _json
-        prompt = (
-            f"Tu es un expert BIM qui aide des TPE/PME du BTP à répondre à des appels d'offres.\n\n"
-            f"Bloc d'exigence : {bid} -- {titre}\n"
-            f"Statut détecté : {statut}\n"
-            f"Lot concerné : {lot}\n"
-            f"Extrait convention BIM (p.{ctx['conv_page']}) : {ctx['conv_extrait']}\n"
-            f"Extrait CCTP (p.{ctx['cctp_page']}) : {ctx['cctp_extrait']}\n"
-            f"Plateforme CDE détectée : {ctx['plateforme'] or 'non détectée'}\n"
-            f"Logiciel BIM : {ctx['logiciel'] or 'non détecté'}\n"
-            f"Format IFC : {ctx['format_ifc'] or 'non détecté'}\n\n"
-            f"Génère exactement 2 questions d'auto-évaluation contextualisées "
-            f"(basées sur les extraits réels ci-dessus, pas des questions génériques). "
-            f"Chaque question doit avoir 3 niveaux de réponse (0=Non, 1=Partiel, 2=Oui) "
-            f"et un poids (1 ou 2).\n"
-            f"Réponds UNIQUEMENT en JSON valide, sans texte autour, au format :\n"
-            f'[{{"question":"...","indice_0":"...","indice_1":"...","indice_2":"...","poids":2}}]'
-        )
-        body = _json.dumps({
-            "model": "claude-sonnet-4-6",
-            "max_tokens": 800,
-            "messages": [{"role": "user", "content": prompt}]
-        }).encode()
-        req = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-            },
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = _json.loads(resp.read())
-        raw = data["content"][0]["text"].strip()
-        # Nettoyer les éventuels backticks markdown
-        raw = re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
-        parsed = _json.loads(raw)
-        if isinstance(parsed, list) and parsed:
-            return parsed
-    except Exception as e:
-        print(f"  ⚠ API Anthropic indisponible ({e}) -- questions programmatiques utilisées.")
-    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # QUESTIONNAIRE INTERACTIF CONTEXTUALISÉ
 # ═══════════════════════════════════════════════════════════════════════════════
-REPS = {"0":0,"n":0,"non":0,"jamais":0,
-        "1":1,"p":1,"partiel":1,"partiellement":1,
-        "2":2,"o":2,"oui":2,"maitrise":2,"maîtrisé":2}
 
 
 class _SafeCtxDict(dict):
@@ -1685,203 +2705,122 @@ class _SafeCtxDict(dict):
         return "{" + key + "}"
 
 
-def _sub_ctx(txt: str, ctx_full: Dict) -> str:
-    """
-    Remplace les {variable} (ex: {plateforme}, {cout}, {logiciel}, {lot}...)
-    dans un texte lu depuis l'Excel (50_Questions) par les valeurs réellement
-    détectées dans les documents. Une valeur absente/vide du contexte est
-    remplacée par une formulation neutre plutôt que de casser l'affichage.
-    Aucune valeur métier n'est codée en dur ici -- tout vient de ctx_full,
-    construit depuis _extraire_details_convention() + le lot courant.
-    """
+def _sub_ctx(txt: str, ctx_full: Dict, messages: Optional[Dict[str, str]] = None) -> str:
+    """Substitue les variables des textes Excel ; les valeurs neutres viennent de 12_Messages_Moteur."""
     if not txt or "{" not in txt:
         return txt
-    defauts = {
-        "plateforme":    "la plateforme CDE du projet",
-        "cout":          ctx_full.get("cout_plateforme") or "un coût à préciser",
-        "cout_plateforme": ctx_full.get("cout_plateforme") or "un coût à préciser",
-        "logiciel":      "un logiciel BIM",
-        "fmt_ifc":       ctx_full.get("format_ifc") or "IFC",
-        "format_ifc":    ctx_full.get("format_ifc") or "IFC",
-        "lod":           "le LOD défini dans la convention",
-        "nd":            ctx_full.get("nd") or "le niveau de développement défini",
-        "niveau_bim":    "Niveau 2",
-        "frequence":     "régulièrement",
-        "ref_conv":      f"p. {ctx_full['conv_page']}" if ctx_full.get("conv_page") else "dans la convention",
-        "ref_cctp":      f"p. {ctx_full['cctp_page']}" if ctx_full.get("cctp_page") else "dans le CCTP",
-        "ref_plateforme": f"p. {ctx_full['plateforme_page']} de la convention" if ctx_full.get("plateforme_page") else "dans la convention",
-        "lot":           "",
+    messages = messages or {}
+    defaults = {
+        "plateforme": render_message(messages, "ctx_default_plateforme"),
+        "cout": ctx_full.get("cout_plateforme") or render_message(messages, "ctx_default_cout"),
+        "cout_plateforme": ctx_full.get("cout_plateforme") or render_message(messages, "ctx_default_cout"),
+        "logiciel": render_message(messages, "ctx_default_logiciel"),
+        "fmt_ifc": ctx_full.get("format_ifc") or render_message(messages, "ctx_default_format_ifc"),
+        "format_ifc": ctx_full.get("format_ifc") or render_message(messages, "ctx_default_format_ifc"),
+        "lod": render_message(messages, "ctx_default_lod"),
+        "nd": ctx_full.get("nd") or render_message(messages, "ctx_default_nd"),
+        "niveau_bim": render_message(messages, "ctx_default_niveau_bim"),
+        "frequence": render_message(messages, "ctx_default_frequence"),
+        "ref_conv": (f"p. {ctx_full['conv_page']}" if ctx_full.get("conv_page") else render_message(messages, "ctx_default_ref_convention")),
+        "ref_cctp": (f"p. {ctx_full['cctp_page']}" if ctx_full.get("cctp_page") else render_message(messages, "ctx_default_ref_cctp")),
+        "ref_plateforme": (f"p. {ctx_full['plateforme_page']}" if ctx_full.get("plateforme_page") else render_message(messages, "ctx_default_ref_plateforme")),
+        "lot": "",
     }
-    valeurs = {**defauts, **{k: v for k, v in ctx_full.items() if v}}
+    values = {**defaults, **{k: v for k, v in ctx_full.items() if v not in (None, "")}}
     try:
-        return txt.format_map(_SafeCtxDict(valeurs))
+        return txt.format_map(_SafeCtxDict(values))
     except Exception:
         return txt
 
 
+
 def poser_questionnaire(blocs: pd.DataFrame, lot: str,
                         resultats_lecture: Dict,
-                        questions: pd.DataFrame = None,
-                        api_key: str = "",
+                        questions: pd.DataFrame,
+                        axes_config: Dict,
+                        messages: Dict[str, str],
                         gloss: pd.DataFrame = None,
                         detections: pd.DataFrame = None,
                         metadata_rules: pd.DataFrame = None,
                         reponses_fournies: Optional[Dict[str, int]] = None) -> Dict:
-    """
-    Génère et pose des questions contextualisées à partir des extraits
-    réellement trouvés dans les documents (convention + CCTP).
-    Les questions sont lues depuis la feuille 50_Questions de l'Excel (questions DataFrame).
-    Toute ligne ajoutée dans 50_Questions sera automatiquement posée.
-    Mode API optionnel si api_key fournie — utilisé si 50_Questions vide pour un bloc.
-    """
-    # La capacité de l'entreprise est indépendante du statut contractuel.
-    # On évalue donc tous les blocs non exclus qui possèdent des questions
-    # actives dans 50_Questions, y compris les blocs dont la preuve
-    # contractuelle n'est pas encore démontrée.
-    question_block_ids = set()
-    if questions is not None and not questions.empty:
-        question_block_ids = {
-            clean(value) for value in questions["id_bloc"].astype(str).tolist()
-            if clean(value)
-        }
-    # La capacité de l'entreprise reste mesurée même lorsqu'une exigence est
-    # contractuellement exclue : cela permet au radar de représenter l'ensemble
-    # du questionnaire sans confondre applicabilité et capacité.
-    blocs_applicables = {
-        bid for bid in resultats_lecture
-        if (not question_block_ids or bid in question_block_ids)
-    }
-    titres = {clean(b["id_bloc"]): clean(b["titre_bloc"])
-              for _, b in blocs.iterrows()}
-
-    if not blocs_applicables:
-        print("\nAucun bloc non exclu avec questions actives. Questionnaire ignoré.")
+    """Évalue tous les blocs disposant de questions actives dans 50_Questions."""
+    if questions is None or questions.empty:
         return {}
-
-    resultats = {}
-    print()
-    print("=" * 70)
-    print(f"  AUTO-ÉVALUATION BIM -- Lot : {lot}")
-    print("  Questions générées à partir de la convention et du CCTP analysés.")
-    print("  Répondez : 0 (Non)  /  1 (Partiel)  /  2 (Oui)")
-    if api_key:
-        print("  Mode enrichi : questions générées par l'API Anthropic.")
-    print("=" * 70)
-
-    # Ordre naturel croissant : B01, B02, ..., B06A, B06B, B10, etc.
-    blocs_ordonnes = sorted(blocs_applicables, key=block_sort_key)
-
-    for num, bid in enumerate(blocs_ordonnes, 1):
-        res   = resultats_lecture[bid]
-        titre = titres.get(bid, bid)
-
-        # Extraire le contexte documentaire réel
+    block_ids = [clean(v) for v in questions["id_bloc"].astype(str).tolist() if clean(v)]
+    block_ids = sorted(set(block_ids), key=block_sort_key)
+    titles = {clean(b["id_bloc"]): clean(b.get("titre_bloc", "")) for _, b in blocs.iterrows()}
+    results = {}
+    for bid in block_ids:
+        if bid not in resultats_lecture:
+            continue
+        res = resultats_lecture[bid]
         ctx = _extraire_details_convention(
-            bid,
-            res.get("conv_pf", ""), res.get("conv_pg", ""),
+            bid, res.get("conv_pf", ""), res.get("conv_pg", ""),
             res.get("cctp_pf", ""), res.get("cctp_pg", ""),
-            res.get("_conv_text", ""),
-            lot, gloss=gloss, detections=detections, metadata_rules=metadata_rules
+            res.get("_conv_text", ""), lot,
+            gloss=gloss, detections=detections, metadata_rules=metadata_rules,
         )
-
-        # ── Générer les questions depuis 50_Questions (Excel) ───────────────────
-        # Toute ligne ajoutée dans la feuille 50_Questions est lue automatiquement.
-        # Les {variables} (ex: {plateforme}, {cout}) sont substituées avec le
-        # contexte réellement détecté dans les documents pour ce bloc.
-        # Si aucune question Excel pour ce bloc → fallback API ou programmatique.
-        qs_excel = []
         ctx_sub = {**ctx, "lot": lot}
-        if questions is not None and not questions.empty:
-            rows_q = questions[
-                questions["id_bloc"].astype(str).str.strip() == bid
+        rows_q = questions[questions["id_bloc"].astype(str).str.strip() == bid]
+        score = score_max = 0
+        answers = []
+        for _, row in rows_q.iterrows():
+            if clean(row.get("actif", "Oui")).casefold() in {"non", "false", "0"}:
+                continue
+            qid = clean(row.get("id_question", ""))
+            if not qid:
+                continue
+            qtxt = _sub_ctx(str(row.get("question", "")), ctx_sub, messages)
+            labels = [
+                _sub_ctx(str(row.get("indice_0", "")), ctx_sub, messages),
+                _sub_ctx(str(row.get("indice_1", "")), ctx_sub, messages),
+                _sub_ctx(str(row.get("indice_2", "")), ctx_sub, messages),
             ]
-            # Lire chaque ligne active de la feuille 50_Questions
-            for _, qrow in rows_q.iterrows():
-                actif = str(qrow.get("actif", "oui")).strip().lower()
-                if actif in ("non", "false", "0"):
-                    continue
-                qs_excel.append({
-                    "id_question": clean(qrow.get("id_question", f"{bid}_Q{len(qs_excel)+1}")),
-                    "question":  _sub_ctx(str(qrow.get("question",  "")), ctx_sub),
-                    "indice_0":  _sub_ctx(str(qrow.get("indice_0",  "Non.")), ctx_sub),
-                    "indice_1":  _sub_ctx(str(qrow.get("indice_1",  "Partiellement.")), ctx_sub),
-                    "indice_2":  _sub_ctx(str(qrow.get("indice_2",  "Oui.")), ctx_sub),
-                    "poids":     int(float(qrow.get("poids", 1) or 1)),
-                })
-
-        if qs_excel:
-            # Questions lues depuis l'Excel — source de vérité
-            qs = qs_excel
-        elif api_key:
-            # Pas de questions Excel pour ce bloc → essayer l'API
-            qs = _questions_via_api(bid, titre, res["statut"], ctx, lot, api_key)
-            if qs is None:
-                qs = _questions_programmatiques(bid, titre, res["statut"], ctx, lot)
-        else:
-            # Fallback programmatique (questions génériques contextualisées)
-            qs = _questions_programmatiques(bid, titre, res["statut"], ctx, lot)
-
-        print(f"\n{'─'*70}")
-        print(f"  Bloc {num}/{len(blocs_ordonnes)} -- {titre}")
-        print(f"  Statut : {res['statut']}")
-        if ctx["conv_extrait"]:
-            extrait_court = ctx["conv_extrait"][:120].replace("\n", " ")
-            print(f"  Ref. convention p.{ctx['conv_page']} : \u00ab {extrait_court}... \u00bb")
-        if ctx["cctp_extrait"]:
-            extrait_court = ctx["cctp_extrait"][:120].replace("\n", " ")
-            print(f"  Ref. CCTP p.{ctx['cctp_page']} : \u00ab {extrait_court}... \u00bb")
-        print(f"{'─'*70}")
-
-        score, score_max, reps_bloc = 0, 0, []
-        for qi, q in enumerate(qs, 1):
-            qtxt  = str(q.get("question", ""))
-            ind0  = str(q.get("indice_0", "Non."))
-            ind1  = str(q.get("indice_1", "Partiellement."))
-            ind2  = str(q.get("indice_2", "Oui."))
-            poids = int(q.get("poids", 1) or 1)
-
-            print(f"\n  Q{qi}. {textwrap.fill(qtxt, 66, subsequent_indent='      ')}")
-            print(f"     0 -- {textwrap.fill(ind0, 60, subsequent_indent='         ')}")
-            print(f"     1 -- {textwrap.fill(ind1, 60, subsequent_indent='         ')}")
-            print(f"     2 -- {textwrap.fill(ind2, 60, subsequent_indent='         ')}")
-
-            qid = clean(q.get("id_question", f"{bid}_Q{qi}"))
+            try:
+                weight = int(float(row.get("poids", 1) or 1))
+            except (TypeError, ValueError):
+                weight = 1
             if reponses_fournies is not None:
                 if qid not in reponses_fournies:
                     raise ValueError(f"Réponse manquante pour la question {qid}")
-                try:
-                    val = int(reponses_fournies[qid])
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(f"Réponse invalide pour {qid} : 0, 1 ou 2 attendu") from exc
+                val = int(reponses_fournies[qid])
                 if val not in (0, 1, 2):
                     raise ValueError(f"Réponse invalide pour {qid} : 0, 1 ou 2 attendu")
-                print(f"     Réponse web : {val}")
             else:
+                print(qid + ". " + qtxt)
+                for idx, label in enumerate(labels):
+                    print(f"  {idx} - {label}")
                 while True:
-                    rep = input("     Votre réponse [0/1/2] : ").strip().lower()
-                    if rep in REPS: val = REPS[rep]; break
-                    print("     → Entrez 0, 1 ou 2.")
-
-            score     += val * poids
-            score_max += 2 * poids
-            reps_bloc.append({
+                    raw = input("Votre réponse [0/1/2] : ").strip()
+                    if raw in {"0", "1", "2"}:
+                        val = int(raw)
+                        break
+            score += val * weight
+            score_max += 2 * weight
+            action_capacite = ""
+            if val == 0:
+                action_capacite = _sub_ctx(str(row.get("action_si_non", "")), ctx_sub, messages)
+            elif val == 1:
+                action_capacite = _sub_ctx(str(row.get("action_si_partiel", "")), ctx_sub, messages)
+            answers.append({
                 "id_question": qid,
                 "question": qtxt,
                 "reponse_val": val,
-                "reponse_label": [ind0, ind1, ind2][val],
-                "poids": poids,
+                "reponse_label": labels[val],
+                "poids": weight,
+                "action_capacite": action_capacite,
             })
-
-        pct    = round(score / score_max * 100) if score_max else 0
-        niveau = "Confirmé" if pct >= 70 else ("Intermédiaire" if pct >= 40 else "Débutant")
-        resultats[bid] = {
-            "titre": titre, "score": score,
-            "max": score_max, "pct": pct,
-            "niveau": niveau, "reponses": reps_bloc,
+        if not answers:
+            continue
+        pct = round(score / score_max * 100) if score_max else 0
+        code = capacity_code_for_pct(axes_config, pct)
+        label = clean(((axes_config.get("capacite") or {}).get(code) or {}).get("label")) or code
+        results[bid] = {
+            "titre": titles.get(bid, bid), "score": score, "max": score_max,
+            "pct": pct, "capacite_code": code, "niveau": label, "reponses": answers,
         }
-        print(f"\n  ✓ {bid} : {score}/{score_max} ({pct}%) -- {niveau}")
+    return results
 
-    return resultats
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DIAGRAMME RADAR
@@ -1897,16 +2836,6 @@ def flatten_answers(scores_eval: Dict) -> Dict[str, int]:
     return out
 
 
-def _regle_entreprise_ok(operateur: str, valeur_reelle: object, valeur_attendue: str) -> bool:
-    op = clean(operateur).lower()
-    reel = clean(valeur_reelle)
-    if op == "non_vide":
-        return bool(reel)
-    if op == "equals":
-        return norm(reel) == norm(valeur_attendue)
-    if op == "contains_any":
-        return any(norm(v) in norm(reel) for v in valeur_attendue.split("|") if clean(v))
-    return False
 
 
 def _regle_reponse_ok(operateur: str, valeur_reelle: int, valeur_attendue: int) -> bool:
@@ -1916,95 +2845,49 @@ def _regle_reponse_ok(operateur: str, valeur_reelle: int, valeur_attendue: int) 
             ">": valeur_reelle > valeur_attendue}.get(op, False)
 
 
-def detecter_contradictions(coherence: Optional[pd.DataFrame], entreprise: Dict[str, str],
-                             scores_eval: Dict, resultats_lecture: Dict) -> List[Dict]:
-    """
-    Applique 55_Regles_Coherence : compare un champ de 70_Entreprise à une
-    réponse précise du questionnaire (pas juste la moyenne du bloc). Une
-    contradiction trouvée est à la fois retournée globalement et rattachée
-    au bloc concerné (resultats_lecture[bid]["contradictions"]), pour bloquer
-    la génération du texte à copier sur ce bloc précis. Aucune règle codée
-    en dur -- tout vient de l'Excel.
-    """
+def detecter_contradictions(coherence: Optional[pd.DataFrame], scores_eval: Dict,
+                             resultats_lecture: Optional[Dict] = None) -> List[Dict]:
+    """Applique les comparaisons question-vers-question définies dans 55_Regles_Coherence."""
     if coherence is None or coherence.empty:
         return []
-    reponses = flatten_answers(scores_eval)
-    trouvees: List[Dict] = []
-    for _, regle in coherence.iterrows():
-        actif = clean(regle.get("actif", "Oui")).lower()
-        if actif in ("non", "false", "0"):
+    responses = flatten_answers(scores_eval)
+    found: List[Dict] = []
+    for _, rule in coherence.iterrows():
+        if clean(rule.get("actif", "Oui")).casefold() in {"non", "false", "0"}:
             continue
-        qid = clean(regle.get("id_question", ""))
-        if qid not in reponses:
+        q1 = clean(rule.get("id_question_1", ""))
+        q2 = clean(rule.get("id_question_2", ""))
+        if q1 not in responses or q2 not in responses:
             continue
-        champ = clean(regle.get("champ_entreprise", ""))
-        cond_e = _regle_entreprise_ok(regle.get("operateur_entreprise", ""),
-                                       entreprise.get(champ, ""), clean(regle.get("valeurs_entreprise", "")))
-        cond_r = _regle_reponse_ok(regle.get("operateur_reponse", ""),
-                                    reponses[qid], int(float(regle.get("valeur_reponse", 0) or 0)))
-        if cond_e and cond_r:
-            item = {
-                "id_regle": clean(regle.get("id_regle", "")),
-                "gravite": clean(regle.get("gravite", "")),
-                "penalite": int(float(regle.get("penalite", 0) or 0)),
-                "message": clean(regle.get("message", "")),
-                "id_question": qid,
-            }
-            trouvees.append(item)
-            bid = qid.split("_Q", 1)[0]
-            if bid in resultats_lecture:
-                resultats_lecture[bid].setdefault("contradictions", []).append(item)
-    return trouvees
+        try:
+            v1 = int(float(rule.get("valeur_1", 0)))
+            v2 = int(float(rule.get("valeur_2", 0)))
+        except (TypeError, ValueError):
+            continue
+        c1 = _regle_reponse_ok(rule.get("operateur_1", ""), responses[q1], v1)
+        c2 = _regle_reponse_ok(rule.get("operateur_2", ""), responses[q2], v2)
+        if not (c1 and c2):
+            continue
+        item = {
+            "id_regle": clean(rule.get("id_regle", "")),
+            "gravite": clean(rule.get("gravite", "")),
+            "penalite": int(float(rule.get("penalite", 0) or 0)),
+            "message": clean(rule.get("message", "")),
+            "id_question_1": q1,
+            "id_question_2": q2,
+        }
+        found.append(item)
+        if resultats_lecture is not None:
+            for qid in (q1, q2):
+                bid = qid.split("_Q", 1)[0]
+                if bid in resultats_lecture:
+                    bucket = resultats_lecture[bid].setdefault("contradictions", [])
+                    if item not in bucket:
+                        bucket.append(item)
+    return found
 
 
-def calculer_indice_fiabilite(resultats_lecture: Dict, textes_reponse: Dict,
-                               contradictions: List[Dict], params: Dict[str, object]) -> Tuple[int, Dict[str, int]]:
-    """
-    Indice de fiabilité = moyenne pondérée de 4 composantes mesurables
-    (poids dans 05_Parametres_Moteur), plutôt qu'un simple ratio de
-    complétude qui ne mesure ni l'exactitude ni la cohérence :
-      - exactitude_contractuelle : % de blocs pertinents avec une citation réelle
-      - coherence     : 100 - somme des pénalités de contradiction
-      - preuves       : % de textes générés dont les conditions sont satisfaites
-      - couverture    : % de blocs applicables ayant un texte généré
-    """
-    pertinents = [r for r in resultats_lecture.values() if r.get("presence_contractuelle") != "ABSENTE"]
-    if pertinents:
-        preuve_ok = sum(1 for r in pertinents if r.get("conv_pf") or r.get("cctp_pf"))
-        exactitude = round(preuve_ok / len(pertinents) * 100)
-    else:
-        exactitude = 100
 
-    coherence = max(0, 100 - sum(c.get("penalite", 0) for c in contradictions))
-
-    tentatives = list(textes_reponse.values())
-    if tentatives:
-        ok = sum(1 for v in tentatives if v.get("conditions_ok") and v.get("texte"))
-        preuves = round(ok / len(tentatives) * 100)
-    else:
-        preuves = 100 if not pertinents else 0
-
-    applicables_gen = set(p_list(params, "applicabilites_generation")) or {"APPLICABLE", "PROBABLE", "A_CONFIRMER"}
-    ids_applicables = [bid for bid, r in resultats_lecture.items()
-                        if r.get("presence_contractuelle") != "ABSENTE"
-                        and r.get("applicabilite_lot") in applicables_gen]
-    if ids_applicables:
-        couverts = sum(1 for bid in ids_applicables if textes_reponse.get(bid, {}).get("texte"))
-        couverture = round(couverts / len(ids_applicables) * 100)
-    else:
-        couverture = 100
-
-    composantes = {"exactitude_contractuelle": exactitude, "coherence": coherence,
-                   "preuves": preuves, "couverture": couverture}
-    poids = {
-        "exactitude_contractuelle": p_int(params, "poids_qualite_contractuelle", 30),
-        "coherence": p_int(params, "poids_qualite_coherence", 30),
-        "preuves": p_int(params, "poids_qualite_preuves", 20),
-        "couverture": p_int(params, "poids_qualite_couverture", 20),
-    }
-    total_poids = sum(poids.values()) or 100
-    indice = round(sum(composantes[k] * poids[k] for k in composantes) / total_poids)
-    return indice, composantes
 
 
 def p_list(params: Dict[str, object], cle: str) -> List[str]:
@@ -2012,50 +2895,19 @@ def p_list(params: Dict[str, object], cle: str) -> List[str]:
     return v if isinstance(v, list) else split_kw(v)
 
 
-def generate_radar(scores: Dict, lot: str) -> io.BytesIO:
-    blocs = list(scores.keys())
-    # Labels depuis l'Excel uniquement — troncature simple, aucun replace codé en dur
-    labels = []
-    for bid in blocs:
-        t = scores[bid]["titre"].split("(")[0].split("—")[0].strip()[:22]
-        labels.append(f"{bid}\n{t}")
-
-    vals = [scores[b]["pct"] / 100 for b in blocs]
-    N = len(blocs)
-    angles = [n / N * 2 * np.pi for n in range(N)] + [0]
-    vals_plot = vals + vals[:1]
-
-    fig, ax = plt.subplots(figsize=(6.5,6.5), subplot_kw=dict(polar=True))
-    ax.set_facecolor("#F8F9FA"); fig.patch.set_facecolor("white")
-    ax.set_rlabel_position(30)
-    ax.set_yticks([.25,.5,.75,1]); ax.set_yticklabels(["25%","50%","75%","100%"],size=7,color="#888")
-    ax.set_ylim(0,1)
-    ax.fill(angles,[1]*len(angles),color="#FCE4D6",alpha=0.25)
-    ax.fill(angles,[0.7]*len(angles),color="#FFF2CC",alpha=0.35)
-    ax.fill(angles,[0.4]*len(angles),color="#E2EFDA",alpha=0.45)
-    ax.plot(angles, vals_plot,'o-',linewidth=2,color="#1F4E78",markersize=5)
-    ax.fill(angles, vals_plot,alpha=0.25,color="#2E75B6")
-    ax.set_xticks(angles[:-1]); ax.set_xticklabels(labels,size=7.5,color="#1F4E78",fontweight="bold")
-    patches = [mpatches.Patch(color="#E2EFDA",label="≥ 40% -- Intermédiaire"),
-               mpatches.Patch(color="#FFF2CC",label="≥ 70% -- Confirmé")]
-    ax.legend(handles=patches,loc="upper right",bbox_to_anchor=(1.35,1.1),fontsize=7)
-    ax.set_title(f"Maturité BIM -- Lot {lot}",size=11,color="#1F4E78",fontweight="bold",pad=20)
-    buf = io.BytesIO()
-    plt.tight_layout(); plt.savefig(buf,format="png",dpi=150,bbox_inches="tight"); plt.close()
-    buf.seek(0); return buf
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SÉLECTION TEXTE DE RÉPONSE
 # ═══════════════════════════════════════════════════════════════════════════════
-def get_ligne_reponse(textes: pd.DataFrame, bid: str, pct: int) -> Optional[pd.Series]:
-    """Retourne la ligne 60_Reponses complète (toutes colonnes) pour ce bloc/pct."""
+def get_ligne_reponse(textes: pd.DataFrame, bid: str, capacite_code: str) -> Optional[pd.Series]:
+    """Sélectionne 60_Reponses par code de capacité ; aucun seuil n'est recalculé ici."""
     cands = textes[textes["id_bloc"].astype(str).str.strip() == bid]
-    for _, r in cands.iterrows():
-        smin = int(r.get("pct_min", r.get("score_min", 0)) or 0)
-        smax = int(r.get("pct_max", r.get("score_max", 100)) or 100)
-        if smin <= pct <= smax:
-            return r
-    return cands.iloc[-1] if not cands.empty else None
+    if "capacite_code" in cands.columns:
+        exact = cands[cands["capacite_code"].astype(str).str.strip() == clean(capacite_code)]
+        if not exact.empty:
+            return exact.iloc[0]
+    return None
+
 
 
 def _evaluer_condition_simple(expr: str, valeurs: Dict[str, int]) -> bool:
@@ -2080,17 +2932,7 @@ def _evaluer_condition_simple(expr: str, valeurs: Dict[str, int]) -> bool:
             "<": reel < val, ">": reel > val}.get(op, True)
 
 
-def get_texte(textes: pd.DataFrame, bid: str, pct: int) -> Tuple[str,str]:
-    cands = textes[textes["id_bloc"].astype(str).str.strip() == bid]
-    for _, r in cands.iterrows():
-        smin = int(r.get("pct_min", r.get("score_min", 0)) or 0)
-        smax = int(r.get("pct_max", r.get("score_max", 100)) or 100)
-        if smin <= pct <= smax:
-            return clean(r["texte_reponse"]), clean(r["niveau_label"])
-    if not cands.empty:
-        last = cands.iloc[-1]
-        return clean(last["texte_reponse"]), clean(last.get("niveau_label",""))
-    return "", ""
+
 
 
 def preparer_textes_reponse(
@@ -2102,80 +2944,209 @@ def preparer_textes_reponse(
     messages: Dict[str, str],
     engine_params: Dict[str, object],
 ) -> Dict[str, Dict]:
-    """Construit une seule fois les engagements proposés pour tous les livrables.
-
-    Les mêmes règles de prudence sont ainsi utilisées dans le dashboard, le
-    rapport de synthèse, le plan d'actions et l'annexe technique.
-    """
+    """Prépare les formulations 60_Reponses sans classification codée dans Python."""
     if not scores_eval:
         return {}
-    applicabilites = set(p_list(engine_params, "applicabilites_generation")) or {
-        "APPLICABLE", "PROBABLE", "A_CONFIRMER"
-    }
-    reponses_brutes = flatten_answers(scores_eval)
-    resultat: Dict[str, Dict] = {}
-    nom = entreprise or "L'entreprise"
-    lot_val = lot or "ce lot"
-
-    def nettoie(t: str) -> str:
-        return (t.replace("[Nom de l'entreprise]", nom).replace("[nom de l'entreprise]", nom)
-                 .replace("{entreprise}", nom).replace("[lot]", lot_val).replace("{lot}", lot_val)
-                 .replace("du projet du projet", "du projet")
-                 .replace("la plateforme la plateforme", "la plateforme")
-                 .replace("au workflow la plateforme", "au workflow de la plateforme")
-                 .replace("aux règles la plateforme", "aux règles de la plateforme"))
-
-    for bid, sc in scores_eval.items():
-        res_bid = resultats_lecture.get(bid, {})
-        if res_bid.get("presence_contractuelle") == "ABSENTE":
-            resultat[bid] = {
-                "texte": "", "niveau": "", "statut_generation": "bloqué",
-                "avertissement": render_message(messages, "paragraphe_presence_absente"),
-            }
+    allowed = set(p_list(engine_params, "applicabilites_generation"))
+    response_values = flatten_answers(scores_eval)
+    output: Dict[str, Dict] = {}
+    default_engagement = p_text(engine_params, "niveau_engagement_defaut")
+    presence_abs = p_text(engine_params, "presence_code_absente")
+    for bid, score in scores_eval.items():
+        result = resultats_lecture.get(bid, {})
+        if result.get("presence_contractuelle") == presence_abs:
+            output[bid] = {"texte": "", "niveau": "", "statut_generation": "", "avertissement": render_message(messages, "paragraphe_presence_absente")}
             continue
-        if res_bid.get("applicabilite_lot") not in applicabilites:
-            resultat[bid] = {
-                "texte": "", "niveau": "", "statut_generation": "bloqué",
-                "avertissement": render_message(messages, "paragraphe_bloque"),
-            }
+        if allowed and result.get("applicabilite_lot") not in allowed:
+            output[bid] = {"texte": "", "niveau": "", "statut_generation": "", "avertissement": render_message(messages, "paragraphe_bloque")}
             continue
-        if res_bid.get("contradictions"):
-            resultat[bid] = {
-                "texte": "", "niveau": "", "statut_generation": "bloqué",
-                "avertissement": render_message(messages, "paragraphe_contradiction"),
-            }
+        if result.get("contradictions"):
+            output[bid] = {"texte": "", "niveau": "", "statut_generation": "", "avertissement": render_message(messages, "paragraphe_contradiction")}
             continue
-
-        ligne = get_ligne_reponse(textes, bid, sc.get("pct", 0))
-        if ligne is None:
+        code = clean(score.get("capacite_code"))
+        row = get_ligne_reponse(textes, bid, code)
+        if row is None:
             continue
-        cond_ok = _evaluer_condition_simple(ligne.get("conditions_questions", ""), reponses_brutes)
-        niveau_eng = clean(ligne.get("niveau_engagement", "")) or (
-            "ferme" if sc.get("pct", 0) >= 70 else "conditionnel"
-        )
+        cond_ok = _evaluer_condition_simple(row.get("conditions_questions", ""), response_values)
+        engagement = clean(row.get("niveau_engagement", "")) or default_engagement
+        ctx = {"entreprise": entreprise, "lot": lot}
+        text = _sub_ctx(clean(row.get("texte_reponse", "")), ctx, messages)
         if cond_ok:
-            resultat[bid] = {
-                "texte": nettoie(clean(ligne.get("texte_reponse", ""))),
-                "niveau": clean(ligne.get("niveau_label", "")),
-                "statut_generation": niveau_eng,
-                "conditions_ok": True,
-            }
+            output[bid] = {"texte": text, "niveau": clean(row.get("niveau_label", "")), "statut_generation": engagement, "conditions_ok": True}
         else:
-            secours = clean(ligne.get("texte_secours", ""))
-            if secours:
-                resultat[bid] = {
-                    "texte": nettoie(secours),
-                    "niveau": clean(ligne.get("niveau_label", "")),
-                    "statut_generation": "conditionnel",
-                    "conditions_ok": False,
-                    "avertissement": render_message(messages, "paragraphe_bloque"),
-                }
-            else:
-                resultat[bid] = {
-                    "texte": "", "niveau": "", "statut_generation": "bloqué",
-                    "avertissement": render_message(messages, "paragraphe_bloque"),
-                }
-    return resultat
+            fallback = _sub_ctx(clean(row.get("texte_secours", "")), ctx, messages)
+            output[bid] = {
+                "texte": fallback, "niveau": clean(row.get("niveau_label", "")),
+                "statut_generation": engagement if fallback else "",
+                "conditions_ok": False, "avertissement": render_message(messages, "paragraphe_bloque"),
+            }
+    return output
+
+
+def extraire_priorite_pieces_ccap(path: Optional[Path], rules: List[Dict[str, object]],
+                                   params: Dict[str, object], messages: Dict[str, str]) -> Dict[str, object]:
+    """Repère un ordre de pièces uniquement avec 37_CCAP_Reperage et 05_Parametres_Moteur."""
+    if not path:
+        return {"provided": False, "status": "not_provided", "items": [], "message": render_message(messages, "ccap_non_fourni")}
+    if not path.exists():
+        return {"provided": False, "status": "not_provided", "items": [], "message": render_message(messages, "ccap_non_fourni")}
+    doc = fitz.open(str(path))
+    configured_max_pages = p_int(params, "ccap_max_pages", 0)
+    max_pages = len(doc) if configured_max_pages <= 0 else min(len(doc), configured_max_pages)
+    lines = []
+    tables = []
+    for page_idx in range(max_pages):
+        page = doc[page_idx]
+        for raw in page.get_text().splitlines():
+            text = clean(raw)
+            if text:
+                lines.append({"page": page_idx + 1, "text": text})
+        # Les CCAP présentent parfois la hiérarchie sous forme de tableau :
+        # PyMuPDF permet de conserver les colonnes (rang / pièce / observation)
+        # que la lecture ligne à ligne mélange. L'interprétation des en-têtes
+        # reste entièrement pilotée par 37_CCAP_Reperage.
+        try:
+            finder = page.find_tables()
+            for table in getattr(finder, "tables", []) or []:
+                rows = table.extract() or []
+                if rows:
+                    tables.append({"page": page_idx + 1, "rows": rows})
+        except Exception:
+            # La détection de tableaux est un enrichissement : le parseur
+            # historique ligne à ligne reste le repli sans échec bloquant.
+            pass
+    doc.close()
+    active = [r for r in rules if clean(r.get("actif", "Oui")).casefold() not in {"non", "false", "0"}]
+    def by_type(kind):
+        rows = [r for r in active if clean(r.get("type_regle", "")).upper() == kind]
+        def order(r):
+            try: return int(float(r.get("priorite", 9999)))
+            except (TypeError, ValueError): return 9999
+        return sorted(rows, key=order)
+    def matches(text, rule):
+        mode = clean(rule.get("mode", "contient")).lower()
+        motif = str(rule.get("motif", "") or "")
+        if mode == "regex":
+            try: return re.search(motif, text, flags=re.IGNORECASE)
+            except re.error: return None
+        return True if contains(text, motif) else None
+    anchors = by_type("ANCRE")
+    priority_rules = by_type("MARQUEUR_PRIORITE")
+    item_rules = by_type("ITEM")
+    stop_rules = by_type("STOP")
+    ignore_rules = by_type("IGNORER")
+    table_rank_header_rules = by_type("TABLE_RANK_HEADER")
+    table_item_header_rules = by_type("TABLE_ITEM_HEADER")
+    table_rank_value_rules = by_type("TABLE_RANK_VALUE")
+    max_after = p_int(params, "ccap_max_lignes_apres_ancre", 0)
+    min_items = p_int(params, "ccap_min_pieces", 0)
+    max_items = p_int(params, "ccap_max_pieces", 0)
+    require_marker = p_text(params, "ccap_exiger_marqueur_priorite").casefold() in {"oui", "true", "1", "yes"}
+    anchor_indices = [i for i, entry in enumerate(lines) if any(matches(entry["text"], r) for r in anchors)]
+    if not anchor_indices:
+        return {"provided": True, "status": "not_found", "items": [], "message": render_message(messages, "ccap_ordre_non_identifie")}
+
+    marker_seen = False
+    first_anchor_page = lines[anchor_indices[0]]["page"]
+    for anchor_idx in anchor_indices:
+        end_idx = min(len(lines), anchor_idx + 1 + max_after) if max_after else len(lines)
+        window = lines[anchor_idx:end_idx]
+        marker_found = any(any(matches(entry["text"], r) for r in priority_rules) for entry in window)
+        marker_seen = marker_seen or marker_found
+        if require_marker and not marker_found:
+            continue
+
+        # Priorité aux tableaux structurés lorsque le CCAP contient explicitement
+        # des colonnes de rang et de pièce. Les noms de colonnes et le format du
+        # rang sont paramétrés dans 37_CCAP_Reperage : aucune discipline, aucun
+        # projet et aucun libellé de pièce n'est codé ici.
+        if table_rank_header_rules and table_item_header_rules and table_rank_value_rules:
+            window_pages = {entry["page"] for entry in window}
+            for table_info in tables:
+                if table_info.get("page") not in window_pages:
+                    continue
+                rows = table_info.get("rows") or []
+                if len(rows) < 2:
+                    continue
+                header = [clean(cell) for cell in (rows[0] or [])]
+                rank_col = next((idx for idx, cell in enumerate(header) if any(matches(cell, r) for r in table_rank_header_rules)), None)
+                item_col = next((idx for idx, cell in enumerate(header) if any(matches(cell, r) for r in table_item_header_rules)), None)
+                if rank_col is None or item_col is None or rank_col == item_col:
+                    continue
+                table_items = []
+                for row in rows[1:]:
+                    if not row or max(rank_col, item_col) >= len(row):
+                        continue
+                    rank_text = clean(row[rank_col])
+                    item_text = clean(str(row[item_col] or "").replace("\n", " "))
+                    rank_match = next((matches(rank_text, r) for r in table_rank_value_rules if matches(rank_text, r)), None)
+                    if not rank_match or not item_text:
+                        continue
+                    try:
+                        if hasattr(rank_match, "groups") and rank_match.groups():
+                            order_value = int(rank_match.group(1))
+                        else:
+                            order_value = int(float(rank_text))
+                    except (TypeError, ValueError):
+                        order_value = len(table_items) + 1
+                    table_items.append({"order": order_value, "text": item_text, "page": table_info.get("page")})
+                    if max_items and len(table_items) >= max_items:
+                        break
+                if len(table_items) >= min_items:
+                    page = table_items[0]["page"] if table_items else lines[anchor_idx]["page"]
+                    return {
+                        "provided": True, "status": "identified", "page": page, "items": table_items,
+                        "message": render_message(messages, "ccap_ordre_identifie", page=page),
+                        "source_label": render_message(messages, "ccap_source_label", page=page),
+                        "extraction_mode": "table",
+                    }
+
+        items = []
+        started = False
+        current_item = None
+        for entry in window[1:]:
+            text = entry["text"]
+            # Les lignes de pagination/en-tête explicitement paramétrées sont
+            # ignorées sans interrompre une liste qui se poursuit sur la page suivante.
+            if any(matches(text, r) for r in ignore_rules):
+                continue
+            if started and any(matches(text, r) for r in stop_rules):
+                break
+            captured = None
+            for rule in item_rules:
+                m = matches(text, rule)
+                if not m:
+                    continue
+                if hasattr(m, "groups") and m.groups():
+                    captured = clean(m.group(1))
+                else:
+                    captured = text
+                break
+            if captured:
+                started = True
+                current_item = {"order": len(items) + 1, "text": captured, "page": entry["page"]}
+                items.append(current_item)
+                if max_items and len(items) >= max_items:
+                    break
+                continue
+            # Mécanique générique de reconstruction des lignes coupées par la mise
+            # en page du PDF : après le début d'un item, une ligne qui n'est ni
+            # un nouvel item ni un marqueur d'arrêt prolonge l'item courant.
+            if started and current_item:
+                current_item["text"] = clean(f'{current_item["text"]} {text}')
+        if len(items) < min_items:
+            continue
+
+        page = items[0]["page"] if items else lines[anchor_idx]["page"]
+        return {
+            "provided": True, "status": "identified", "page": page, "items": items,
+            "message": render_message(messages, "ccap_ordre_identifie", page=page),
+            "source_label": render_message(messages, "ccap_source_label", page=page),
+        }
+
+    if require_marker and not marker_seen:
+        return {"provided": True, "status": "section_without_priority", "items": [], "page": first_anchor_page, "message": render_message(messages, "ccap_rubrique_sans_priorite")}
+    return {"provided": True, "status": "not_found", "items": [], "page": first_anchor_page, "message": render_message(messages, "ccap_ordre_non_identifie")}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GÉNÉRATION DU RAPPORT COMPLET
@@ -2194,620 +3165,646 @@ def generate_rapport(
     conv_text: str,
     marque: str = None,
     logo_path: str = None,
+    adresse: str = None,
+    email: str = None,
+    analyste: str = None,
+    nom_projet: str = None,
+    documents: str = None,
     detections: pd.DataFrame = None,
     metadata_rules: pd.DataFrame = None,
     questions: pd.DataFrame = None,
     textes_reponse: Dict[str, Dict] = None,
-    entreprise_data: Dict[str, str] = None,
     conv_infos: Dict[str, str] = None,
     cctp_infos: Dict[str, str] = None,
-    contradictions: List[str] = None,
-    web_only: bool = False,
+    contradictions: List[Dict] = None,
     axes_config: Dict = None,
+    restitution_rules: List[Dict[str, object]] = None,
+    messages: Dict[str, str] = None,
+    ccap_reperage: Dict[str, object] = None,
+    ccap_text: str = "",
+    points_vigilance: List[Dict[str, str]] = None,
 ):
-    """Génère les 3 livrables, toujours dans les deux formats disponibles :
-
-    1. Plan_Actions_Offre_BIM.pdf + .html : actions, questions et textes d'offre.
-    2. Glossaire_BIM.pdf + .html : termes BIM détectés (documents, questionnaire, outil).
-    3. Dashboard (Rapport_BIM.html) : généré séparément par build_dashboard(), HTML uniquement.
-    """
+    """Génère plan d'actions et glossaire à partir du modèle public déjà calculé."""
     textes_reponse = textes_reponse or {}
-    entreprise_data = entreprise_data or {}
     conv_infos = conv_infos or {}
     cctp_infos = cctp_infos or {}
     contradictions = contradictions or []
+    messages = messages or {}
+    ccap_reperage = ccap_reperage or {}
+    points_vigilance = points_vigilance or []
 
-    # Les champs libres de l'Excel peuvent contenir des variables de contexte.
-    # On les substitue sur une copie afin de conserver les données moteur intactes.
     ctx = {
         **_extraire_details_convention(
             "GLOBAL", "", "", "", "", conv_text, lot,
-            conv_pages=conv.pages, gloss=gloss,
-            detections=detections, metadata_rules=metadata_rules,
+            conv_pages=conv.pages, gloss=gloss, detections=detections, metadata_rules=metadata_rules,
         ),
         "lot": lot,
     }
-    colonnes_libres = [
+    free_cols = [
         "description_convention", "lecture_entreprise", "risque_si_ignore",
         "type_preuve_cctp_attendue", "interpretation_croisee",
         "action_confirmee", "action_probable", "action_non_applicable",
-        "question_bim_manager",
-        "proposition_commerciale", "action_interne_standard",
-        "action_interne_capacite",
+        "question_bim_manager", "proposition_commerciale", "action_interne_standard",
+        "action_interne_capacite", "action_interne_a_confirmer", "action_interne_non_demontree",
     ]
     report_results: Dict[str, Dict] = {}
     for bid, res in resultats_lecture.items():
-        copie = dict(res)
-        bloc = dict(res.get("bloc", {}))
-        for col in colonnes_libres:
-            bloc[col] = _sub_ctx(str(bloc.get(col, "")), ctx)
-        bloc["question_bim_manager"] = filtrer_question_bm(
-            bloc.get("question_bim_manager", ""),
-            res.get("conv_pf", ""), res.get("cctp_pf", ""),
-            conv.text, lot,
-        )
-        copie["bloc"] = bloc
-        report_results[bid] = copie
+        copy = dict(res)
+        block = dict(res.get("bloc", {}))
+        for col in free_cols:
+            block[col] = _sub_ctx(str(block.get(col, "")), ctx, messages)
+        block["question_bim_manager"] = clean(block.get("question_bim_manager", ""))
+        copy["bloc"] = block
+        report_results[bid] = copy
 
-    cctp_detail = "Non fourni"
+    convention_detail = conv_infos.get("nom_fichier") or conv.name
+    if conv_infos.get("indice"):
+        convention_detail += f" - indice {conv_infos['indice']}"
+    convention_detail += f" - {len(conv.pages)} pages"
+    cctp_detail = ""
     if cctp:
         cctp_detail = cctp_infos.get("nom_fichier") or cctp.name
         if cctp_infos.get("indice"):
             cctp_detail += f" - indice {cctp_infos['indice']}"
         cctp_detail += f" - {len(cctp.pages)} pages"
-    convention_detail = conv_infos.get("nom_fichier") or conv.name
-    if conv_infos.get("indice"):
-        convention_detail += f" - indice {conv_infos['indice']}"
-    convention_detail += f" - {len(conv.pages)} pages"
 
-    documents_resume = f"Convention : {conv.name}"
-    if cctp:
-        documents_resume += f" | CCTP : {cctp.name}"
-    else:
-        documents_resume += " | CCTP non fourni"
-
-    _texte_glossaire = (
-        f"{conv_text or ''} {cctp.text if cctp else ''} "
-        f"{texte_outil_et_questionnaire(blocs, questions)}"
-    )
-
+    docs_resume = clean(documents)
+    # Deux périmètres de glossaire sont volontairement distingués :
+    # - glossary_entries : vocabulaire nécessaire aux infobulles des livrables,
+    #   qui peut inclure des termes utilisés par l'outil lui-même ;
+    # - glossary_export_entries : glossaire autonome, limité aux termes réellement
+    #   repérés dans les documents techniques analysés (Convention + CCTP).
+    # Cela évite qu'un nom de plateforme ou un terme uniquement présent dans le
+    # questionnaire soit présenté comme « détecté dans ce dossier ».
+    glossary_tool_text = f"{conv_text or ''} {cctp.text if cctp else ''} {texte_outil_et_questionnaire(blocs, questions)}"
+    cctp_pages = cctp.pages if cctp else []
+    glossary_export_entries = glossary_entries_detected_documents(gloss, conv.pages, cctp_pages)
     meta = {
         "projet": conv.name.replace(".pdf", ""),
-        "entreprise": entreprise,
-        "lot": lot,
-        "marque": marque or entreprise or "Entreprise",
-        "date": datetime.now().strftime("%d/%m/%Y"),
-        "documents_resume": documents_resume,
+        "nom_projet": clean(nom_projet) if nom_projet else clean(conv_infos.get("operation", "")),
+        "documents_analyses": docs_resume,
+        "documents_resume": docs_resume,
         "convention_detail": convention_detail,
         "cctp_detail": cctp_detail,
+        "entreprise": entreprise,
+        "lot": lot,
+        "marque": marque or entreprise,
+        "adresse": clean(adresse), "email": clean(email), "analyste": clean(analyste),
+        "date": datetime.now().strftime("%d/%m/%Y"),
         "contradictions": contradictions,
-        "referent_bim": entreprise_data.get("referent_bim_nom", ""),
-        "glossary_entries": glossary_entries_from_dataframe(
-            filtrer_glossaire_detecte(gloss, _texte_glossaire)
-        ),
+        "glossary_entries": glossary_entries_from_dataframe(filtrer_glossaire_detecte(gloss, glossary_tool_text)),
+        "glossary_export_entries": glossary_export_entries,
         "axes_config": axes_config or {},
+        "restitution_rules": restitution_rules or [],
+        "messages": messages,
+        "engine_params": ENGINE_PARAMS_GLOBAL,
+        "ccap_reperage": ccap_reperage,
+        "points_vigilance": points_vigilance,
         **charger_logo(logo_path),
     }
+    # Réparation strictement visuelle : le moteur a déjà terminé ses décisions.
+    report_results = _reparer_obj_affichage(report_results)
+    textes_reponse = _reparer_obj_affichage(textes_reponse)
+    meta = _reparer_obj_affichage(meta)
 
-    # V14 : chaque livrable qui a un PDF (Plan d'Actions, Glossaire) est
-    # désormais généré dans les deux formats, y compris via le web -- pour
-    # que l'interface propose systématiquement "Télécharger PDF" / "Ouvrir HTML".
     base_path = out if out.suffix.lower() == ".pdf" else out.with_suffix(".pdf")
-    action_pdf = base_path.with_name("Plan_Actions_Offre_BIM.pdf")
-    action_html = base_path.with_name("Plan_Actions_Offre_BIM.html")
-    glossary_html_path = base_path.with_name("Glossaire_BIM.html")
-    glossary_pdf_path = base_path.with_name("Glossaire_BIM.pdf")
+    generate_action_plan_pdf(base_path.with_name("Plan_Actions_Offre_BIM.pdf"), report_results, scores_eval, textes_reponse, meta)
+    generate_action_plan_html(base_path.with_name("Plan_Actions_Offre_BIM.html"), report_results, scores_eval, textes_reponse, meta)
+    generate_glossary_html(base_path.with_name("Glossaire_BIM.html"), meta)
+    generate_glossary_pdf(base_path.with_name("Glossaire_BIM.pdf"), meta)
 
-    generate_action_plan_pdf(action_pdf, report_results, scores_eval, textes_reponse, meta)
-    generate_action_plan_html(action_html, report_results, scores_eval, textes_reponse, meta)
-    generate_glossary_html(glossary_html_path, meta)
-    generate_glossary_pdf(glossary_pdf_path, meta)
-
-    print(f"✓ Plan d'actions PDF généré : {action_pdf}")
-    print(f"✓ Plan d'actions HTML généré : {action_html}")
-    print(f"✓ Glossaire HTML généré : {glossary_html_path}")
-    print(f"✓ Glossaire PDF généré : {glossary_pdf_path}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
-    ap = argparse.ArgumentParser(
-        description="Outil opérationnel BIM -- Lecture + Auto-éval + Réponse AO"
-    )
-    ap.add_argument("--param",        default="Parametrage_Outil_BIM_V1.xlsx")
-    ap.add_argument("--convention",   required=True)
-    ap.add_argument("--cctp",         default=None)
-    ap.add_argument("--lot",          default=None)
-    ap.add_argument("--entreprise",   default=None)
-    ap.add_argument("--marque",       default=None,
-                    help="Sigle affiché en en-tête des livrables (par défaut : --entreprise).")
-    ap.add_argument("--logo",         default=None,
-                    help="Chemin d'une image PNG/JPEG à insérer en en-tête des livrables, à la place du sigle texte.")
-    ap.add_argument("--out",          default="Rapport_BIM_Complet.pdf")
-    ap.add_argument("--sans_eval",    action="store_true",
-                    help="Génère uniquement la partie lecture, sans questionnaire")
-    ap.add_argument("--web-only", action="store_true",
-                    help="Génère uniquement le dashboard HTML et le plan d'action HTML")
-    ap.add_argument("--api-key",      default="",
-                    dest="api_key",
-                    help="Clé API Anthropic pour questions enrichies (optionnel). "
-                         "Peut aussi être définie via la variable d'environnement ANTHROPIC_API_KEY.")
-    ap.add_argument("--reponses-json", default="", dest="reponses_json",
-                    help="Fichier JSON {id_question: 0|1|2} pour un lancement web/non interactif.")
-    ap.add_argument("--format",       default="both",
-                    choices=["pdf","html","both"],
-                    help="Format de sortie : pdf, html (dashboard interactif), both (défaut)")
+    ap = argparse.ArgumentParser(description="Outil BIM paramétré")
+    ap.add_argument("--param", default="Parametrage_Outil_BIM_V1.xlsx")
+    ap.add_argument("--convention", default=None)
+    ap.add_argument("--cctp", default=None)
+    ap.add_argument("--ccap", default=None)
+    ap.add_argument("--lot", default="")
+    ap.add_argument("--entreprise", default="")
+    ap.add_argument("--marque", default="")
+    ap.add_argument("--logo", default=None)
+    ap.add_argument("--adresse", default="")
+    ap.add_argument("--email", default="")
+    ap.add_argument("--analyste", default="")
+    ap.add_argument("--nom-projet", dest="nom_projet", default="")
+    ap.add_argument("--documents", default="")
+    ap.add_argument("--complements-json", default="", dest="complements_json")
+    ap.add_argument("--out", default="Rapport_BIM.html")
+    ap.add_argument("--sans_eval", action="store_true")
+    ap.add_argument("--web-only", action="store_true")
+    ap.add_argument("--reponses-json", default="", dest="reponses_json")
+    ap.add_argument("--autoeval-only", action="store_true", dest="autoeval_only")
+    ap.add_argument("--format", default="both", choices=["pdf", "html", "both"])
     args = ap.parse_args()
 
-    reponses_web = None
-    if args.reponses_json:
-        rp = Path(args.reponses_json)
-        if not rp.exists():
-            raise SystemExit(f"Fichier de réponses introuvable : {rp}")
-        try:
-            reponses_web = json.loads(rp.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise SystemExit(f"JSON de réponses invalide : {exc}")
-        if not isinstance(reponses_web, dict):
-            raise SystemExit("Le JSON de réponses doit être un objet {id_question: 0|1|2}.")
-
     param = Path(args.param)
-    if not param.exists(): raise SystemExit(f"Paramétrage introuvable : {param}")
-    conv_path = Path(args.convention)
-    if not conv_path.exists(): raise SystemExit(f"Convention introuvable : {conv_path}")
-
-    # ── Lecture feuille 70_Entreprise ─────────────────────────────────
-    ent = load_entreprise(param)
-    lots_ent = get_lots_entreprise(ent)
-
-    # Nom entreprise : priorité CLI > feuille 70_Entreprise (clé nom_entreprise)
-    if not args.entreprise:
-        args.entreprise = ent.get("nom_entreprise", "").strip() or "[Nom de l'entreprise]"
-    print(f"  → Entreprise : {args.entreprise}")
-
-    # Lot : priorité CLI > feuille 70_Entreprise (clés lot_1…lot_5)
-    if not args.lot:
-        if lots_ent:
-            args.lot = lots_ent[0]
-            print(f"  → Lot lu depuis 70_Entreprise : {args.lot}")
-        else:
-            args.lot = "Lot"
-    # Normaliser le nom du lot
-    import re as _re
-    lot_clean = args.lot.strip()
-    # Supprimer préfixes redondants : "le lot ", "lot " (sauf "Lot 3 — Façade")
-    lot_clean = _re.sub(r"^le\s+lot\s+", "", lot_clean, flags=_re.IGNORECASE).strip()
-    # Garder "Lot 3 — Façade" tel quel, supprimer "lot " seul
-    if not _re.match(r"^lot\s+\d", lot_clean, _re.IGNORECASE):
-        lot_clean = _re.sub(r"^lot\s+", "", lot_clean, flags=_re.IGNORECASE).strip()
-    # Si après nettoyage le lot est vide ou juste un article → garder l'original
-    args.lot = lot_clean if len(lot_clean) > 2 else args.lot.strip()
-    # Si encore vide après nettoyage → fallback silencieux
-    if not args.lot or args.lot.lower() in ("le lot", "lot", "le"):
-        args.lot = "Lot"
-    print(f"\n→ Analyse pour : {args.entreprise} · {args.lot}")
-
-    # Chargement
-    (blocs, gloss, questions, textes, signaux, detections,
-     metadata_rules, axes_config_df, coherence_rules, messages_df, params_df) = load_all(param)
+    if not param.exists():
+        raise SystemExit(f"Paramétrage introuvable : {param}")
+    (blocs, gloss, questions, textes, signaux, detections, metadata_rules,
+     axes_df, coherence_rules, messages_df, params_df, text_filters_df,
+     restitution_df, ccap_rules_df, interblock_rules_df, document_rules_df) = load_all(param)
     questions = normalize_questions_dataframe(questions)
     engine_params = load_params(params_df)
     messages = load_messages(messages_df)
-    axes_config = load_axes_config(axes_config_df)
+    axes_config = load_axes_config(axes_df)
+    restitution_rules = load_rule_rows(restitution_df)
+    ccap_rules = load_rule_rows(ccap_rules_df)
+    interblock_rules = load_rule_rows(interblock_rules_df)
+    document_rules = load_rule_rows(document_rules_df)
+    configure_text_filters(text_filters_df, engine_params)
+
+    supplied_answers = None
+    if args.reponses_json:
+        answer_path = Path(args.reponses_json)
+        if not answer_path.exists():
+            raise SystemExit(f"Fichier de réponses introuvable : {answer_path}")
+        supplied_answers = json.loads(answer_path.read_text(encoding="utf-8"))
+        if not isinstance(supplied_answers, dict):
+            raise SystemExit("Le JSON de réponses doit être un objet {id_question: 0|1|2}.")
+
+    if args.autoeval_only:
+        if supplied_answers is None:
+            raise SystemExit("--autoeval-only nécessite --reponses-json.")
+        dummy = {}
+        for _, block in blocs.iterrows():
+            bid = clean(block.get("id_bloc", ""))
+            if bid:
+                dummy[bid] = {"bloc": block, "conv_pf": "", "conv_pg": "", "cctp_pf": "", "cctp_pg": "", "_conv_text": "", "contradictions": []}
+        scores = poser_questionnaire(
+            blocs, args.lot, dummy, questions, axes_config, messages,
+            gloss=gloss, detections=detections, metadata_rules=metadata_rules,
+            reponses_fournies=supplied_answers,
+        )
+        contradictions = detecter_contradictions(coherence_rules, scores, None)
+        out = Path(args.out)
+        out_html = out if out.suffix.lower() == ".html" else out.with_suffix(".html")
+        out_pdf = out_html.with_suffix(".pdf")
+        generate_autoevaluation_reports(
+            out_html, out_pdf, scores, axes_config, messages,
+            {"entreprise": args.entreprise, "lot": args.lot, "adresse": args.adresse,
+             "email": args.email, "analyste": args.analyste, "date": datetime.now().strftime("%d/%m/%Y"),
+             "contradictions": contradictions, "engine_params": engine_params,
+             "marque": args.marque or args.entreprise, **charger_logo(args.logo)},
+        )
+        print(f"Auto-évaluation HTML générée : {out_html}")
+        print(f"Auto-évaluation PDF générée : {out_pdf}")
+        return
+
+    if not args.convention:
+        raise SystemExit("La convention BIM est requise pour l'analyse classique.")
+    conv_path = Path(args.convention)
+    if not conv_path.exists():
+        raise SystemExit(f"Convention introuvable : {conv_path}")
     conv = lire_pdf(conv_path)
-    # Extraction métadonnées convention depuis pages BRUTES fitz (avant nettoyage)
-    _conv_doc_raw = fitz.open(str(conv_path))
-    _conv_pgs_raw = [_conv_doc_raw[i].get_text() for i in range(min(10, len(_conv_doc_raw)))]
-    _conv_infos   = _extraire_infos_document(_conv_pgs_raw, detections, metadata_rules)
-    _conv_doc_raw.close()
+    qualite_conv = evaluer_lisibilite_document(conv, engine_params)
+    qualite_conv["label"] = conv_path.name
+    if qualite_conv.get("statut") == "NON_EXPLOITABLE":
+        raise SystemExit(render_message(messages, "pdf_convention_non_exploitable_error"))
+    metadata_pages = p_int(engine_params, "fenetre_metadata_pages", len(conv.pages))
+    raw_conv_doc = fitz.open(str(conv_path))
+    raw_conv_pages = [raw_conv_doc[i].get_text() for i in range(min(metadata_pages, len(raw_conv_doc)))]
+    conv_infos = _extraire_infos_document(raw_conv_pages, detections, metadata_rules)
+    conv_infos["nom_fichier"] = conv_path.stem
+    raw_conv_doc.close()
+
     cctp = None
+    cctp_infos = {}
+    qualite_cctp: Dict[str, object] = {}
     if args.cctp:
-        cp = Path(args.cctp)
-        if not cp.exists():
-            print(f"  ⚠ CCTP introuvable : {cp} -- poursuite de l'analyse avec la convention seule.")
-        else:
-            cctp = lire_pdf(cp)
-            # Extraction page de garde + en-têtes du CCTP (même logique que convention)
-            _cctp_doc  = fitz.open(str(cp))
-            _cctp_pgs  = [_cctp_doc[i].get_text() for i in range(min(10, len(_cctp_doc)))]
-            _cctp_infos = _extraire_infos_document(_cctp_pgs, detections, metadata_rules)
-            _cctp_infos["n_pages"] = len(_cctp_doc)
-            _cctp_infos["nom_fichier"] = cp.stem
-    if not cctp:
-        _cctp_infos = {}
+        cctp_path = Path(args.cctp)
+        if cctp_path.exists():
+            cctp = lire_pdf(cctp_path)
+            qualite_cctp = evaluer_lisibilite_document(cctp, engine_params)
+            qualite_cctp["label"] = cctp_path.name
+            raw_doc = fitz.open(str(cctp_path))
+            raw_pages = [raw_doc[i].get_text() for i in range(min(metadata_pages, len(raw_doc)))]
+            cctp_infos = _extraire_infos_document(raw_pages, detections, metadata_rules)
+            cctp_infos.update({"n_pages": len(raw_doc), "nom_fichier": cctp_path.stem})
+            raw_doc.close()
     cctp_text = cctp.text if cctp else ""
+    ccap_path = Path(args.ccap) if args.ccap else None
+    ccap_reperage = extraire_priorite_pieces_ccap(ccap_path, ccap_rules, engine_params, messages)
+    # Le CCAP reste hors sélection documentaire implicite. Sa lisibilité est
+    # contrôlée et seules les règles Excel déclarées source=CCAP peuvent utiliser
+    # une clause prescriptive ciblée pour enrichir un bloc.
+    qualite_ccap: Dict[str, object] = {}
+    ccap_doc = lire_pdf(ccap_path) if ccap_path and ccap_path.exists() else None
+    if ccap_doc:
+        qualite_ccap = evaluer_lisibilite_document(ccap_doc, engine_params)
+        qualite_ccap["label"] = ccap_path.name
+    ccap_text = ccap_doc.text if ccap_doc else ""
 
-    # ── MODULE 1 : LECTURE ────────────────────────────────────────────────────
-    print(f"\n[1/3] Analyse des exigences BIM -- Convention : {conv.name}")
-    if not cctp:
-        print("  ⚠ Aucun CCTP fourni -- analyse basée sur la convention uniquement.")
-        print("  Les statuts PROBABLE/NON DÉMONTRÉE seront plus fréquents sans CCTP de lot.")
-    ORD = {"CONFIRMÉE":0,"PROBABLE":1,"PARTIELLE":2,"NON DÉMONTRÉE":3,"NON APPLICABLE":4}
-    resultats_lecture = {}
+    supplement_docs: List[Dict[str, object]] = []
+    if args.complements_json:
+        manifest_path = Path(args.complements_json)
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for idx, item in enumerate(manifest.get("items", []) or []):
+                if not isinstance(item, dict):
+                    continue
+                stored_name = clean(item.get("stored_name"))
+                supp_path = manifest_path.parent / stored_name
+                if not stored_name or not supp_path.exists():
+                    continue
+                supp_doc = lire_pdf(supp_path)
+                supp_quality = evaluer_lisibilite_document(supp_doc, engine_params)
+                supp_quality["label"] = clean(item.get("display_name")) or supp_path.name
+                if supp_quality.get("statut") == "NON_EXPLOITABLE":
+                    raise SystemExit(render_message(messages, "supplement_unreadable_error"))
+                supplement_docs.append({
+                    "index": idx,
+                    "path": supp_path,
+                    "doc": supp_doc,
+                    "quality": supp_quality,
+                    "display_name": clean(item.get("display_name")) or supp_path.name,
+                    "reference": clean(item.get("reference")),
+                    "origin_source": clean(item.get("origin_source")).upper(),
+                    "origin_page": clean(item.get("origin_page")),
+                    "origin_excerpt": clean(item.get("origin_excerpt")),
+                    "related_blocks": {clean(x).upper() for x in (item.get("related_blocks") or []) if clean(x)},
+                    "resolved_reference": clean(item.get("reference")) if verifier_resolution_piece_ajoutee(
+                        clean(item.get("reference")), clean(item.get("display_name")) or supp_path.name,
+                        supp_doc.pages, document_rules, engine_params,
+                    ) else "",
+                })
 
-    # Ordre depuis l'Excel 10_Blocs uniquement — jamais codé en dur
-    blocs_sorted = blocs.copy()
-
-    # ── PASSE 1 : calculer scores et extraits bruts pour tous les blocs ──────
-    # On ne décide PAS encore quelles citations afficher.
-    _raw: Dict = {}
-    for _, b in blocs_sorted.iterrows():
-        bid   = clean(b["id_bloc"])
-        kws   = split_kw(b.get("keywords_convention",""))
-        strong= split_kw(b.get("keywords_preuve_forte",""))
-        kws_c = (split_kw(b.get("keywords_cctp_confirme","")) +
-                 split_kw(b.get("keywords_cctp_nuance","")))
+    print(f"Analyse pour : {args.entreprise} - {args.lot}")
+    print("[1/3] Analyse des exigences BIM")
+    threshold = p_int(engine_params, "seuil_preuve_ciblee", 0)
+    raw: Dict[str, Dict] = {}
+    evidence_started = time.perf_counter()
+    for _, block in blocs.iterrows():
+        bid = clean(block.get("id_bloc", ""))
+        kws = split_kw(block.get("keywords_convention", ""))
+        strong = split_kw(block.get("keywords_preuve_forte", ""))
+        extra_conf, extra_fort = _kws_depuis_signaux(bid, signaux)
+        cctp_confirm = split_kw(block.get("keywords_cctp_confirme", ""))
+        cctp_nuance = split_kw(block.get("keywords_cctp_nuance", ""))
+        cctp_kws = cctp_confirm + cctp_nuance + extra_conf + extra_fort
+        cctp_strong = cctp_confirm + extra_fort
+        cctp_exclu = split_kw(block.get("keywords_cctp_exclu", ""))
+        cctp_positive_signal = any_kw_non_negated(cctp_text, cctp_confirm + extra_conf + extra_fort)
+        cctp_nuance_signal = any_kw_non_negated(cctp_text, cctp_nuance)
         conv_pg, conv_pf, conv_sc, conv_key = best_evidence(conv, kws, strong, set())
         cctp_pg, cctp_pf, cctp_sc, cctp_key = best_evidence(
-            cctp, kws+kws_c, split_kw(b.get("keywords_cctp_confirme","")), set())
-        _raw[bid] = {
-            "b": b,
-            "conv_pg": conv_pg, "conv_pf": conv_pf, "conv_sc": conv_sc, "conv_key": conv_key,
-            "cctp_pg": cctp_pg, "cctp_pf": cctp_pf, "cctp_sc": cctp_sc, "cctp_key": cctp_key,
-        }
+            cctp, cctp_kws, cctp_strong, set(), lot=args.lot, enforce_lot_scope=True
+        )
+        cctp_ex_pg, cctp_ex_pf, cctp_ex_sc, cctp_ex_key = best_evidence(
+            cctp, cctp_exclu, cctp_exclu, set(), lot=args.lot, enforce_lot_scope=True
+        ) if cctp_exclu else ("", "", -999, "")
+        supp_best = {"score": -999, "page": "", "text": "", "key": "", "source": "", "kind": "", "origin": ""}
+        effective_conv_parts = [conv.text]
+        # Cycle 50 : pour l'applicabilité du lot, les clauses explicitement
+        # attribuées à un autre lot sont retirées du corpus CCTP utilisé par
+        # l'évaluation générique. Une clause sans sujet de lot nommé reste active.
+        effective_cctp_parts = [_texte_document_compatible_lot(cctp, args.lot)]
+        for supp in supplement_docs:
+            scoped = supp.get("related_blocks") or set()
+            if scoped and bid.upper() not in scoped:
+                continue
+            supp_doc = supp.get("doc")
+            origin = clean(supp.get("origin_source")).upper()
+            if origin.startswith("CCTP"):
+                effective_cctp_parts.append(_texte_document_compatible_lot(supp_doc, args.lot))
+                skws, sstrong = cctp_kws, cctp_strong
+            else:
+                effective_conv_parts.append(supp_doc.text)
+                skws, sstrong = kws, strong
+            spg, spf, ssc, skey = best_evidence(
+                supp_doc, skws, sstrong, set(), lot=args.lot,
+                enforce_lot_scope=origin.startswith("CCTP")
+            )
+            if ssc > supp_best["score"]:
+                supp_best = {
+                    "score": ssc, "page": spg, "text": spf, "key": skey,
+                    "source": clean(supp.get("display_name")),
+                    "kind": f"supp{int(supp.get('index', 0))}", "origin": origin,
+                    "origin_page": clean(supp.get("origin_page")),
+                    "origin_excerpt": clean(supp.get("origin_excerpt")),
+                }
+        effective_conv_text = "\n".join(x for x in effective_conv_parts if clean(x))
+        effective_cctp_text = "\n".join(x for x in effective_cctp_parts if clean(x))
+        cctp_positive_signal = any_kw_non_negated(effective_cctp_text, cctp_confirm + extra_conf + extra_fort)
+        cctp_nuance_signal = any_kw_non_negated(effective_cctp_text, cctp_nuance)
+        raw[bid] = {"block": block, "conv_pg": conv_pg, "conv_pf": conv_pf, "conv_sc": conv_sc, "conv_key": conv_key,
+                    "cctp_pg": cctp_pg, "cctp_pf": cctp_pf, "cctp_sc": cctp_sc, "cctp_key": cctp_key,
+                    "cctp_ex_pg": cctp_ex_pg, "cctp_ex_pf": cctp_ex_pf, "cctp_ex_sc": cctp_ex_sc, "cctp_ex_key": cctp_ex_key,
+                    "cctp_positive_signal": cctp_positive_signal, "cctp_nuance_signal": cctp_nuance_signal,
+                    "effective_conv_text": effective_conv_text, "effective_cctp_text": effective_cctp_text,
+                    "supp_best": supp_best}
+    print(f"Pré-calcul des preuves terminé en {time.perf_counter() - evidence_started:.2f}s")
+    reutiliser_preuve = p_text(engine_params, "preuve_reutilisation_interblocs").strip().lower() in {"oui", "yes", "true", "1"}
+    excerpt_winner: Dict[str, Tuple[int, str]] = {}
+    if not reutiliser_preuve:
+        for bid, item in raw.items():
+            key, score = item.get("cctp_key", ""), item.get("cctp_sc", -999)
+            if key and score >= threshold and (key not in excerpt_winner or score > excerpt_winner[key][0]):
+                excerpt_winner[key] = (score, bid)
 
-    # ── PASSE 2 : dédoublonnage des citations par EXTRAIT ───────────────────
-    # Une même page peut contenir plusieurs exigences distinctes. L’ancien
-    # arbitrage « un seul bloc gagnant par page » supprimait donc parfois la
-    # preuve directe d’un bloc confirmé. On ne dédoublonne désormais que les
-    # extraits réellement identiques (même clé normalisée).
-    _cctp_excerpt_winner: Dict[str, tuple] = {}  # clé extrait → (score, bid)
-    for bid, r in _raw.items():
-        key, sc = r.get("cctp_key", ""), r["cctp_sc"]
-        if key and sc >= 8:
-            if key not in _cctp_excerpt_winner or sc > _cctp_excerpt_winner[key][0]:
-                _cctp_excerpt_winner[key] = (sc, bid)
-
-    for _, b in blocs_sorted.iterrows():
-        bid = clean(b["id_bloc"])
-        r   = _raw[bid]
-        # Convention : score < 8 → passage trop générique
-        conv_pg = r["conv_pg"] if r["conv_sc"] >= 8 else ""
-        conv_pf = r["conv_pf"] if r["conv_sc"] >= 8 else ""
-        # CCTP : conserver tout extrait ciblé ; ne retirer que les doublons
-        # stricts déjà attribués à un bloc mieux scoré.
-        cctp_pg_raw, cctp_sc_raw, cctp_key = r["cctp_pg"], r["cctp_sc"], r.get("cctp_key", "")
-        if (cctp_pg_raw and cctp_key and cctp_sc_raw >= 8 and
-                _cctp_excerpt_winner.get(cctp_key, (0, ""))[1] == bid):
-            cctp_pg, cctp_pf = cctp_pg_raw, r["cctp_pf"]
+    results: Dict[str, Dict] = {}
+    for bid in sorted(raw, key=block_sort_key):
+        item = raw[bid]; block = item["block"]
+        conv_pf = item["conv_pf"] if item["conv_sc"] >= threshold else ""
+        conv_pg = item["conv_pg"] if conv_pf else ""
+        block_started = time.perf_counter()
+        axes = evaluate(block, item.get("effective_cctp_text", cctp_text), args.lot, item.get("effective_conv_text", conv.text), signaux=signaux, params=engine_params, messages=messages, axes_config=axes_config)
+        block_elapsed = time.perf_counter() - block_started
+        code_non_app = p_text(engine_params, "applicabilite_si_cctp_exclu")
+        has_positive_cctp = bool(item.get("cctp_positive_signal"))
+        has_nuance_cctp = bool(item.get("cctp_nuance_signal"))
+        use_exclusion_evidence = axes.get("applicabilite_lot") == code_non_app and bool(item.get("cctp_ex_pf")) and item.get("cctp_ex_sc", -999) >= threshold
+        if use_exclusion_evidence:
+            cctp_pf = item.get("cctp_ex_pf", "")
+            cctp_pg = item.get("cctp_ex_pg", "")
+            # Ce champ exprime l'existence d'une preuve positive propre au bloc,
+            # indépendamment de la preuve finalement affichée. Les règles Excel
+            # peuvent ainsi gérer un conflit positif/exclusion sans logique métier codée ici.
+            cctp_positive = "Oui" if has_positive_cctp else "Non"
         else:
-            cctp_pg, cctp_pf = "", ""
-
-        axes = evaluate(b, cctp_text, args.lot, conv.text,
-                         signaux=signaux, params=engine_params, messages=messages)
-        statut, cert = statut_legacy(axes["presence_contractuelle"], axes["applicabilite_lot"])
-        concl = axes["conclusion"]
-        resultats_lecture[bid] = {
-            "bloc": b, "statut": statut, "certitude": cert, "conclusion": concl,
-            "presence_contractuelle": axes["presence_contractuelle"],
-            "applicabilite_lot": axes["applicabilite_lot"],
-            "capacite_entreprise": axes["capacite_entreprise"],
-            "contradictions": [],
-            "conv_pg": conv_pg, "conv_pf": conv_pf,
-            "cctp_pg": cctp_pg, "cctp_pf": cctp_pf,
-            "conv_extrait": conv_pf[:200] if conv_pf else "",
-            "cctp_extrait": cctp_pf[:200] if cctp_pf else "",
+            # Une preuve de nuance est conservée comme contexte documentaire sans
+            # être assimilée à une preuve positive. Le statut reste calculé par les
+            # règles Excel (statut_si_nuance_seul / applicabilité).
+            cctp_keep = has_positive_cctp or has_nuance_cctp
+            if cctp_keep and not reutiliser_preuve:
+                cctp_keep = excerpt_winner.get(item.get("cctp_key", ""), (None, None))[1] == bid
+            cctp_pf = item["cctp_pf"] if cctp_keep else ""
+            cctp_pg = item["cctp_pg"] if cctp_keep else ""
+            cctp_positive = "Oui" if (has_positive_cctp and cctp_pf) else "Non"
+        preuve_policy = clean(block.get("politique_preuve_convention", "TOUJOURS")).upper()
+        if cctp_pf and preuve_policy == "MASQUER_SI_PREUVE_CCTP":
+            conv_pf = ""
+            conv_pg = ""
+            if not clean(item.get("supp_best", {}).get("origin", "")).startswith("CCTP"):
+                item["supp_best"] = {"score": -999, "page": "", "text": "", "key": "", "source": "", "kind": "", "origin": ""}
+        results[bid] = {
+            "bloc": block, "conclusion": axes.get("conclusion", ""),
+            "presence_contractuelle": axes.get("presence_contractuelle", ""),
+            "applicabilite_lot": axes.get("applicabilite_lot", ""),
+            "capacite_entreprise": axes.get("capacite_entreprise", ""),
+            "exclusion_explicit": axes.get("exclusion_explicit", False), "contradictions": [],
+            "conv_pg": conv_pg, "conv_pf": conv_pf, "cctp_pg": cctp_pg, "cctp_pf": cctp_pf,
+            "supp_pg": item.get("supp_best", {}).get("page", "") if item.get("supp_best", {}).get("score", -999) >= threshold else "",
+            "supp_pf": item.get("supp_best", {}).get("text", "") if item.get("supp_best", {}).get("score", -999) >= threshold else "",
+            "supp_source": item.get("supp_best", {}).get("source", ""),
+            "supp_kind": item.get("supp_best", {}).get("kind", ""),
+            "supp_origin_source": item.get("supp_best", {}).get("origin", ""),
+            "supp_origin_page": item.get("supp_best", {}).get("origin_page", ""),
+            "supp_origin_excerpt": item.get("supp_best", {}).get("origin_excerpt", ""),
+            "cctp_preuve_positive": "Oui" if (cctp_positive == "Oui" or (item.get("supp_best", {}).get("score", -999) >= threshold and clean(item.get("supp_best", {}).get("origin", "")).startswith("CCTP"))) else "Non",
+            # Indicateur documentaire générique : une nuance a été repérée dans
+            # le CCTP sans être assimilée à une preuve positive. Le paramétrage
+            # du bloc peut ensuite décider du statut public correspondant.
+            "cctp_nuance_detectee": "Oui" if has_nuance_cctp else "Non",
+            "_cctp_positive_pg": item.get("cctp_pg", "") if item.get("cctp_sc", -999) >= threshold else "",
+            "_cctp_positive_pf": item.get("cctp_pf", "") if item.get("cctp_sc", -999) >= threshold else "",
+            # DEV réel 01 : conserver aussi la preuve d'exclusion explicite. Une règle
+            # documentaire plus générale peut affiner une preuve positive, mais elle ne
+            # doit jamais faire disparaître une exclusion CCTP explicite visant le lot.
+            # Le mécanisme reste générique : aucun bloc, lot ou projet n'est codé ici.
+            "_cctp_exclusion_pg": item.get("cctp_ex_pg", "") if item.get("cctp_ex_sc", -999) >= threshold else "",
+            "_cctp_exclusion_pf": item.get("cctp_ex_pf", "") if item.get("cctp_ex_sc", -999) >= threshold else "",
+            "conv_extrait": conv_pf[:200] if conv_pf else "", "cctp_extrait": cctp_pf[:200] if cctp_pf else "",
+            "_conv_text": conv.text,
         }
-        print(f"  {bid} → {axes['presence_contractuelle']} | {axes['applicabilite_lot']}")
+        print(f"{bid} -> {results[bid]['presence_contractuelle']} | {results[bid]['applicabilite_lot']} | {block_elapsed:.2f}s")
+    # Cycle 37 : la qualification documentaire doit précéder les dépendances
+    # interblocs et l'auto-évaluation. Ainsi, lorsqu'une preuve ciblée issue du
+    # paramétrage Excel confirme ou exclut une exigence pour le lot, les blocs
+    # dépendants sont évalués une seule fois à partir de cet état final.
+    # Le moteur reste générique : aucune identité de bloc, de lot ou de projet
+    # n'est codée dans cet ordonnancement.
+    appliquer_gouvernance_preuves(results, engine_params)
 
-    # Gouvernance finale : cohérence stricte entre le lot, les preuves et le statut.
-    appliquer_gouvernance_preuves(resultats_lecture, conv.text, cctp_text, args.lot)
+    # Substitution générique des variables de contexte dans les textes de bloc
+    # avant l'application des règles documentaires. Les textes métier restent
+    # exclusivement dans le classeur de paramétrage.
+    public_ctx = {
+        **_extraire_details_convention(
+            "GLOBAL", "", "", "", "", conv.text, args.lot,
+            conv_pages=conv.pages, gloss=gloss, detections=detections, metadata_rules=metadata_rules,
+        ),
+        "lot": args.lot,
+    }
+    public_text_cols = [
+        "description_convention", "lecture_entreprise", "risque_si_ignore",
+        "type_preuve_cctp_attendue", "interpretation_croisee",
+        "action_confirmee", "action_probable", "action_non_applicable",
+        "question_bim_manager", "proposition_commerciale", "action_interne_standard",
+        "action_interne_capacite", "action_interne_a_confirmer", "action_interne_non_demontree",
+    ]
+    for _res in results.values():
+        _block = dict(_res.get("bloc", {}))
+        for _col in public_text_cols:
+            _block[_col] = _sub_ctx(str(_block.get(_col, "")), {**public_ctx, "lot": args.lot}, messages)
+        _res["bloc"] = _block
 
-    # Trier par priorité
-    resultats_lecture = dict(sorted(
-        resultats_lecture.items(),
-        key=lambda x: ORD.get(x[1]["statut"],5)
-    ))
+    appliquer_regles_documentaires(
+        results, document_rules, args.lot, {**public_ctx, "lot": args.lot}, messages,
+        source_pages={
+            "CONVENTION": conv.pages,
+            "CCTP": (cctp.pages if cctp else []),
+            "CCAP": (ccap_doc.pages if ccap_doc else []),
+            "COMPLEMENT": [
+                {
+                    "page": page_no, "text": page_text,
+                    "source": clean(s.get("display_name")) or render_message(messages, "source_supplement_label"),
+                    "kind": f"supp{int(s.get('index', 0))}",
+                    "related_blocks": list(s.get("related_blocks") or []),
+                }
+                for s in supplement_docs
+                for page_no, page_text in (s.get("doc").pages or [])
+            ],
+        },
+    )
+    # Une règle documentaire peut remplacer une preuve grossière par une clause
+    # ciblée trouvée ailleurs dans le document. Recalculer alors la présence
+    # contractuelle avant d'appliquer les dépendances.
+    appliquer_gouvernance_preuves(results, engine_params)
 
-    # ── MODULE 2 : AUTO-ÉVALUATION ────────────────────────────────────────────
-    scores_eval = {}
-    n_pages_cctp = len(cctp.pages) if cctp else 0  # initialisé ici pour éviter NameError
+    # Les dépendances interblocs sont appliquées après la qualification
+    # documentaire finale. Cela évite de conserver un forçage obsolète lorsque
+    # la preuve ciblée a entre-temps fait évoluer le bloc source.
+    appliquer_regles_interblocs(results, interblock_rules)
+
+    # Si une règle Excel a levé une exclusion au profit d'une clarification et
+    # qu'une preuve positive propre au bloc existe, afficher cette preuve plutôt
+    # que l'extrait d'exclusion général. Le choix métier reste porté par Excel.
+    for _res in results.values():
+        if (
+            clean(_res.get("cctp_preuve_positive")).lower() in {"oui", "yes", "true", "1"}
+            and not bool(_res.get("exclusion_explicit"))
+            and clean(_res.get("_cctp_positive_pf"))
+        ):
+            # Ne pas écraser une preuve plus précise déjà isolée par une règle
+            # documentaire (specific_page/specific_rule_id).
+            if not clean(_res.get("specific_rule_id")):
+                _res["cctp_pf"] = _res.get("_cctp_positive_pf", "")
+                _res["cctp_pg"] = _res.get("_cctp_positive_pg", "")
+                _res["cctp_extrait"] = clean(_res.get("cctp_pf"))[:200]
+    appliquer_gouvernance_preuves(results, engine_params)
+
+    # DEV réel 01 — garde-fou transversal de hiérarchie documentaire.
+    # Lorsqu'une exclusion CCTP explicite a été détectée pour le lot, elle reste
+    # prioritaire après les règles documentaires/interblocs. Cela protège les cas
+    # contradictoires « exclusion explicite + liste positive » sans introduire de
+    # sémantique propre à B01 (ou à un autre bloc) dans le moteur.
+    code_non_app = p_text(engine_params, "applicabilite_si_cctp_exclu")
+    for _res in results.values():
+        if not bool(_res.get("exclusion_explicit")):
+            continue
+        _res["applicabilite_lot"] = code_non_app
+        _res["statut_public_override"] = ""
+        _res["priorite_override"] = ""
+        _res["interblock_exclusion"] = False
+        _res["interblock_reason"] = ""
+        if clean(_res.get("_cctp_exclusion_pf")):
+            _res["cctp_pf"] = _res.get("_cctp_exclusion_pf", "")
+            _res["cctp_pg"] = _res.get("_cctp_exclusion_pg", "")
+            _res["cctp_extrait"] = clean(_res.get("cctp_pf"))[:200]
+    appliquer_gouvernance_preuves(results, engine_params)
+    appliquer_regles_interblocs(results, interblock_rules)
+    appliquer_gouvernance_preuves(results, engine_params)
+    appliquer_securite_cctp_non_lisible(results, qualite_cctp, engine_params, messages)
+
+    print("[2/3] Auto-évaluation")
+    scores = {}
+    contradictions = []
     if not args.sans_eval:
-        print(f"\n[2/3] Auto-évaluation de la maturité numérique")
-        # Résoudre la clé API : argument CLI > variable d'environnement
-        import os
-        api_key = args.api_key or os.environ.get("ANTHROPIC_API_KEY", "")
-        # Injecter conv_text dans les résultats pour la génération contextuelle
-        for bid in resultats_lecture:
-            resultats_lecture[bid]["_conv_text"] = conv.text
-        scores_eval = poser_questionnaire(
-            blocs, args.lot, resultats_lecture,
-            questions=questions,   # feuille 50_Questions lue depuis l'Excel
-            api_key=api_key, gloss=gloss, detections=detections, metadata_rules=metadata_rules,
-            reponses_fournies=reponses_web)
-        # Axe 3 : capacité entreprise, déduite de la maturité du questionnaire
-        for bid, sc in scores_eval.items():
-            if bid in resultats_lecture:
-                pct = sc.get("pct", 0)
-                resultats_lecture[bid]["capacite_entreprise"] = (
-                    "DEMONTREE" if pct >= 70 else ("PARTIELLE" if pct >= 40 else "NON_DEMONTREE"))
-        # Détection de contradictions fiche entreprise / réponses (55_Regles_Coherence)
-        contradictions_globales = detecter_contradictions(coherence_rules, ent, scores_eval, resultats_lecture)
-        if contradictions_globales:
-            print(f"  ⚠ {len(contradictions_globales)} contradiction(s) détectée(s) entre la fiche entreprise et le questionnaire.")
-    else:
-        print(f"\n[2/3] Auto-évaluation ignorée (--sans_eval)")
-        contradictions_globales = []
+        scores = poser_questionnaire(
+            blocs, args.lot, results, questions, axes_config, messages,
+            gloss=gloss, detections=detections, metadata_rules=metadata_rules,
+            reponses_fournies=supplied_answers,
+        )
+        for bid, score in scores.items():
+            if bid in results:
+                results[bid]["capacite_entreprise"] = clean(score.get("capacite_code", ""))
+        contradictions = detecter_contradictions(coherence_rules, scores, results)
 
-    # ── MODULE 3 : RAPPORT ────────────────────────────────────────────────────
-    print(f"\n[3/3] Génération du rapport...")
+    proposals = preparer_textes_reponse(textes, scores, results, args.entreprise, args.lot, messages, engine_params)
+    ensure_public_model(results, scores, proposals, lot=args.lot, axes_config=axes_config, restitution_rules=restitution_rules, messages=messages)
+
+    docs = clean(args.documents)
+    if not docs:
+        names = [conv_path.name]
+        if cctp: names.append(Path(args.cctp).name)
+        if ccap_path and ccap_path.exists(): names.append(ccap_path.name)
+        docs = " | ".join(names)
+    # Les noms des pièces ajoutées font partie du corpus de la nouvelle révision.
+    # Ils sont ajoutés à l'index documentaire pour que la vigilance qui a motivé
+    # l'ajout disparaisse lorsqu'elle correspond effectivement au fichier fourni.
+    if supplement_docs:
+        supp_names = [clean(s.get("display_name")) for s in supplement_docs if clean(s.get("display_name"))]
+        existing_norm = norm(docs)
+        for supp_name in supp_names:
+            if norm(supp_name) not in existing_norm:
+                docs = (docs + " | " + supp_name).strip(" |")
+                existing_norm = norm(docs)
+        # Cycle 43 : une référence ciblée n'est ajoutée à l'index documentaire
+        # qu'après vérification de compatibilité entre le manifeste et le contenu
+        # du PDF. Le nom opaque du fichier n'est donc ni nécessaire ni suffisant.
+        for supp in supplement_docs:
+            resolved_ref = clean(supp.get("resolved_reference"))
+            if resolved_ref and norm(resolved_ref) not in existing_norm:
+                docs = (docs + " | " + resolved_ref).strip(" |")
+                existing_norm = norm(docs)
+
+    quality_map = {
+        "CONVENTION": qualite_conv,
+        "CCTP": qualite_cctp,
+        "CCAP": qualite_ccap,
+    }
+    for supp in supplement_docs:
+        quality_map[f"COMPLEMENT_{supp.get('index', 0)}"] = supp.get("quality") or {}
+    points_vigilance = detecter_points_vigilance_documentaires(
+        conv.text, cctp.text if cctp else "", ccap_text, docs, engine_params, messages,
+        qualite_documents=quality_map,
+        conv_pages=conv.pages,
+        cctp_pages=(cctp.pages if cctp else []),
+        ccap_pages=(ccap_doc.pages if ccap_doc else []),
+        additional_pages=[(clean(s.get("display_name")), s.get("doc").pages) for s in supplement_docs],
+        ccap_hierarchy_pages={int(ccap_reperage.get("page"))} if ccap_reperage.get("page") else set(),
+        document_rules=document_rules,
+    )
+    points_vigilance = qualifier_vigilances_pour_ajout(points_vigilance, results, engine_params)
+
+    print("[3/3] Génération des livrables")
     out_path = Path(args.out)
-
-    # Les mêmes propositions prudentes alimentent tous les livrables.
-    textes_reponse = preparer_textes_reponse(
-        textes, scores_eval, resultats_lecture, args.entreprise, args.lot,
-        messages, engine_params,
+    generate_rapport(
+        out_path.with_suffix(".pdf"), conv, cctp, blocs, gloss, textes, results, scores,
+        args.lot, args.entreprise, conv.text, marque=args.marque, logo_path=args.logo,
+        adresse=args.adresse, email=args.email, analyste=args.analyste, nom_projet=args.nom_projet,
+        documents=docs, detections=detections, metadata_rules=metadata_rules, questions=questions,
+        textes_reponse=proposals, conv_infos=conv_infos, cctp_infos=cctp_infos,
+        contradictions=contradictions, axes_config=axes_config, restitution_rules=restitution_rules,
+        messages=messages, ccap_reperage=ccap_reperage, ccap_text=ccap_text,
+        points_vigilance=points_vigilance,
     )
 
-    if args.web_only:
-        generate_rapport(
-            out_path.with_suffix(".pdf"), conv, cctp, blocs, gloss, textes,
-            resultats_lecture, scores_eval,
-            args.lot, args.entreprise, conv.text,
-            marque=args.marque, logo_path=args.logo,
-            detections=detections, metadata_rules=metadata_rules, questions=questions,
-            textes_reponse=textes_reponse, entreprise_data=ent,
-            conv_infos=_conv_infos, cctp_infos=_cctp_infos,
-            contradictions=contradictions_globales, web_only=True,
-            axes_config=axes_config,
-        )
-
-    # PDF
-    if not args.web_only and args.format in ("pdf", "both"):
-        pdf_path = out_path if out_path.suffix == ".pdf" else out_path.with_suffix(".pdf")
-        generate_rapport(
-            pdf_path, conv, cctp, blocs, gloss, textes,
-            resultats_lecture, scores_eval,
-            args.lot, args.entreprise, conv.text,
-            marque=args.marque, logo_path=args.logo,
-            detections=detections, metadata_rules=metadata_rules, questions=questions,
-            textes_reponse=textes_reponse, entreprise_data=ent,
-            conv_infos=_conv_infos, cctp_infos=_cctp_infos,
-            contradictions=contradictions_globales,
-            axes_config=axes_config,
-        )
-
-    # HTML Dashboard
-    if args.format in ("html", "both"):
-        if not _HAS_DASHBOARD:
-            print("  ⚠ Module dashboard_template.py introuvable -- HTML non généré.")
-        else:
-            html_path = out_path if out_path.suffix == ".html" else out_path.with_suffix(".html")
-            # Les propositions ont déjà été construites avant la génération PDF.
-            # On réutilise exactement le même dictionnaire pour le dashboard.
-            indice_fiabilite, composantes_qualite = calculer_indice_fiabilite(
-                resultats_lecture, textes_reponse, contradictions_globales, engine_params)
-            # Glossaire enrichi : extrait du document réel si trouvé, sinon définition Excel
-            # Le texte de référence pour "un terme est-il pertinent ?" couvre la
-            # convention, le CCTP, le questionnaire d'auto-évaluation (50_Questions)
-            # et les textes que l'outil génère lui-même (10_Blocs) -- pas seulement
-            # une citation mot pour mot des PDF d'entrée.
-            all_txt = (
-                conv.text + (" " + cctp.text if cctp else "")
-                + " " + texte_outil_et_questionnaire(blocs, questions)
-            )
-            cctp_pages_list = cctp.pages if cctp else []
-            gloss_enrichi = enrichir_glossaire(gloss, conv.pages, cctp_pages_list)
-            # Filtrer : garder seulement les termes présents dans les documents
-            gloss_list = [
-                g for g in gloss_enrichi
-                if any(contains(all_txt, m)
-                       for m in (split_kw(
-                           next((row.get("mots_cles","") for _, row in gloss.iterrows()
-                                 if clean(row.get("terme","")) == g["terme"]), "")
-                       ) or [g["terme"]]))
-            ]
-            # ── Contexte global convention (détections dynamiques) ───────────
-            _ctx_glob = _extraire_details_convention(
-                "GLOBAL", "", "", "", "", conv.text, args.lot, conv_pages=conv.pages,
-                gloss=gloss, detections=detections, metadata_rules=metadata_rules
-            )
-
-            # ── KPI thèse ────────────────────────────────────────────────────
-            # Axe 2 : Bloc critique (confirmé avec maturité la plus faible)
-            blocs_conf = {bid: sc for bid, sc in scores_eval.items()
-                          if resultats_lecture.get(bid,{}).get("statut") == "CONFIRMÉE"}
-            bloc_critique = min(blocs_conf, key=lambda b: blocs_conf[b]["pct"]) if blocs_conf else ""
-            bloc_critique_pct = blocs_conf[bloc_critique]["pct"] if bloc_critique else 0
-            bloc_critique_titre = (blocs_conf[bloc_critique]["titre"].split("(")[0].strip()[:35]
-                                   if bloc_critique else "")
-
-            # Axe 1 : Densité BIM CCTP (signaux / pages)
-            n_pages_cctp = len(cctp.pages) if cctp else 0
-            n_signaux_cctp = 0
-            if cctp:
-                for _, txt in cctp.pages:
-                    if has_bim_signal(txt):
-                        n_signaux_cctp += 1
-            if not cctp:
-                densite_cctp = "Non fourni"
-            else:
-                densite_cctp = "Élevée" if n_signaux_cctp >= 5 else ("Moyenne" if n_signaux_cctp >= 2 else "Faible")
-
-            # Axe 3 : Score réponse BIM (maturité moy × complétude paragraphes)
-            n_blocs_app = sum(1 for r in resultats_lecture.values()
-                              if r["statut"] in ("CONFIRMÉE","PROBABLE","PARTIELLE"))
-            n_para = len(textes_reponse)
-            completude = (n_para / n_blocs_app) if n_blocs_app > 0 else 0
-            mat_moy_kpi = (round(sum(s["pct"] for s in scores_eval.values()) / len(scores_eval))
-                           if scores_eval else 0)
-            score_reponse = round(mat_moy_kpi * completude) if scores_eval else 0
-
-            # Axe 4 : Barrière dominante
-            # Sémantique = blocs doc/données (B02, B03, B06A, B06B) faibles
-            # Technologique = blocs maquette (B01, B04, B05) faibles
-            # Organisationnelle = blocs processus (B07, B04) faibles
-            blocs_faibles = [bid for bid, sc in scores_eval.items() if sc["pct"] < 50
-                             and resultats_lecture.get(bid,{}).get("statut")
-                             in ("CONFIRMÉE","PROBABLE","PARTIELLE")]
-            # Catégorisation lue depuis la colonne categorie_barriere de 10_Blocs (Excel)
-            # Un nouveau bloc ajouté dans l'Excel sera classé automatiquement
-            _cat_blocs = {clean(b["id_bloc"]): clean(b.get("categorie_barriere",""))
-                          for _, b in blocs.iterrows() if b.get("categorie_barriere","")}
-            sem  = sum(1 for b in blocs_faibles if _cat_blocs.get(b,"") == "semantique")
-            tech = sum(1 for b in blocs_faibles if _cat_blocs.get(b,"") == "technologique")
-            org  = sum(1 for b in blocs_faibles if _cat_blocs.get(b,"") == "organisationnelle")
-            if sem >= tech and sem >= org:
-                barriere = "Sémantique"
-                barriere_desc = "Difficulté à lire et interpréter les documents contractuels BIM"
-            elif tech >= sem and tech >= org:
-                barriere = "Technologique"
-                barriere_desc = "Absence d'outils ou de compétences BIM pour produire les livrables"
-            else:
-                barriere = "Organisationnelle"
-                barriere_desc = "Absence de processus et de référent BIM dans l'organisation"
-            barriere_blocs = blocs_faibles[:3]
-
-            meta = {
-                "projet": conv.name.replace(".pdf",""),
-                "lot": args.lot,
-                "entreprise": args.entreprise,
-                "marque": args.marque or args.entreprise or "Entreprise",
-                "date": datetime.now().strftime("%d/%m/%Y"),
-                "glossary_entries": glossary_entries_from_dataframe(filtrer_glossaire_detecte(gloss, all_txt)),
-                # Modèle à 3 axes / cohérence / indice de fiabilité
-                "axes_config": axes_config,
-                "contradictions": contradictions_globales,
-                **charger_logo(args.logo),
-                "indice_fiabilite": indice_fiabilite,
-                "indice_fiabilite_nom": "Indice de fiabilité de la réponse BIM",
-                "composantes_qualite": composantes_qualite,
-                "composantes_labels": {
-                    "exactitude_contractuelle": "Exactitude contractuelle",
-                    "coherence": "Cohérence entreprise / réponses",
-                    "preuves": "Preuves et conditions",
-                    "couverture": "Couverture utile",
-                },
-                "qualite_explication": ("L'indice combine exactitude contractuelle, cohérence, preuves et "
-                                        "couverture. Il ne remplace pas une revue humaine avant engagement contractuel."),
-                # KPI thèse
-                "bloc_critique": bloc_critique,
-                "bloc_critique_pct": bloc_critique_pct,
-                "bloc_critique_titre": bloc_critique_titre,
-                "n_signaux_cctp": n_signaux_cctp,
-                "n_pages_cctp": n_pages_cctp,
-                "densite_cctp": densite_cctp,
-                "score_reponse": score_reponse,
-                "n_para": n_para,
-                "n_blocs_app": n_blocs_app,
-                "barriere": barriere,
-                "barriere_desc": barriere_desc,
-                "barriere_blocs": barriere_blocs,
-                # Détections dynamiques convention (plateforme, LOD, etc.)
-                "niveau_bim": _ctx_glob.get("niveau_bim", ""),
-                "dim_4d": _ctx_glob.get("dim_4d", False),
-                "dim_5d": _ctx_glob.get("dim_5d", False),
-                "dim_6d": _ctx_glob.get("dim_6d", False),
-                "dim_7d": _ctx_glob.get("dim_7d", False),
-                "bim_manager_conv": _ctx_glob.get("bim_manager", ""),
-                "coordinateur_bim_conv": _ctx_glob.get("coordinateur_bim", ""),
-                "geo_referencement": _ctx_glob.get("geo_referencement", False),
-                "clash_3d": _ctx_glob.get("clash_3d", False),
-                "doe_numerique": _ctx_glob.get("doe_numerique", False),
-                "formats_livrables": _ctx_glob.get("formats_livrables", ""),
-                "contractuel": _ctx_glob.get("contractuel", False),
-                "plateforme_conv": _ctx_glob.get("plateforme", ""),
-                "plateforme_page_conv": _ctx_glob.get("plateforme_page", ""),
-                "plateforme_extrait_conv": _ctx_glob.get("plateforme_extrait", ""),
-                "logiciel_page_conv": _ctx_glob.get("logiciel_page", ""),
-                "logiciel_extrait_conv": _ctx_glob.get("logiciel_extrait", ""),
-                "format_ifc_page_conv": _ctx_glob.get("format_ifc_page", ""),
-                "format_ifc_extrait_conv": _ctx_glob.get("format_ifc_extrait", ""),
-                "lod_page_conv": _ctx_glob.get("lod_page", ""),
-                "lod_extrait_conv": _ctx_glob.get("lod_extrait", ""),
-                "nd_page_conv": _ctx_glob.get("nd_page", ""),
-                "nd_extrait_conv": _ctx_glob.get("nd_extrait", ""),
-                "niveau_bim_page_conv": _ctx_glob.get("niveau_bim_page", ""),
-                "niveau_bim_extrait_conv": _ctx_glob.get("niveau_bim_extrait", ""),
-                "bim_manager_page_conv": _ctx_glob.get("bim_manager_page", ""),
-                "bim_manager_extrait_conv": _ctx_glob.get("bim_manager_extrait", ""),
-                "coordinateur_bim_page_conv": _ctx_glob.get("coordinateur_bim_page", ""),
-                "coordinateur_bim_extrait_conv": _ctx_glob.get("coordinateur_bim_extrait", ""),
-                "cout_plateforme_conv": _ctx_glob.get("cout_plateforme", ""),
-                "logiciel_conv": _ctx_glob.get("logiciel", ""),
-                "format_ifc_conv": _ctx_glob.get("format_ifc", ""),
-                "lod_conv": _ctx_glob.get("lod", ""),
-                "nd_conv": _ctx_glob.get("nd", ""),
-                "frequence_conv": _ctx_glob.get("frequence", ""),
-                # Métadonnées convention depuis pages BRUTES fitz (indice, date, émetteur)
-                "indice_doc":  _conv_infos.get("indice", ""),
-                "date_doc":    _conv_infos.get("date", ""),
-                "emetteur_doc": _conv_infos.get("emetteur", ""),
-                "phase_doc":   _conv_infos.get("phase", ""),
-                "maitrise_oeuvre_doc": _conv_infos.get("maitrise_oeuvre", ""),
-                "n_pages_convention": len(conv.pages) if conv else 0,
-                # Infos entreprise
-                # Infos entreprise — toutes les clés de 70_Entreprise
-                "ent_adresse":    ent.get("adresse","").strip(),
-                "ent_cp":         ent.get("code_postal","").strip(),
-                "ent_ville":      ent.get("ville","").strip(),
-                "ent_tel":        ent.get("telephone","").strip(),
-                "ent_email":      ent.get("email_contact","").strip(),
-                "ent_dirigeant":  ent.get("dirigeant","").strip(),
-                "ent_siret":      ent.get("siret","").strip(),
-                "ent_referent":   ent.get("referent_bim_nom","").strip(),
-                "ent_ref_email":  ent.get("referent_bim_email","").strip(),
-                "ent_ref_tel":    ent.get("referent_bim_tel","").strip(),
-                "ent_logiciels":  ent.get("logiciels_bim","").strip(),
-                "ent_experience": ent.get("experience_bim","").strip(),
-                "ent_plateforme": ent.get("plateforme_interne","").strip(),
-                "lots_entreprise": lots_ent,
-                # Métadonnées CCTP — extraites depuis page de garde + en-têtes
-                "n_pgs":       _cctp_infos.get("n_pages", n_pages_cctp),
-                "cctp_nom":    _cctp_infos.get("nom_fichier", ""),
-                "cctp_indice": _cctp_infos.get("indice", ""),
-                "cctp_date":   _cctp_infos.get("date", ""),
-                "cctp_auteur": _cctp_infos.get("emetteur", ""),
-                "cctp_phase":  _cctp_infos.get("phase", ""),
-                "cctp_mo":     _cctp_infos.get("maitre_ouvrage", ""),
-                # Métadonnées convention — extraites depuis page de garde
-                "maitre_ouvrage_doc": _conv_infos.get("maitre_ouvrage", ""),
+    if args.format in ("html", "both") and _HAS_DASHBOARD:
+        html_path = out_path if out_path.suffix.lower() == ".html" else out_path.with_suffix(".html")
+        all_text = conv.text + ((" " + cctp.text) if cctp else "") + " " + " ".join(s.get("doc").text for s in supplement_docs) + " " + texte_outil_et_questionnaire(blocs, questions)
+        cctp_pages = cctp.pages if cctp else []
+        full_glossary = enrichir_glossaire(gloss, conv.pages, cctp_pages)
+        # Le panneau "Glossaire utile" du Dashboard suit le même périmètre que
+        # le glossaire autonome : uniquement des termes réellement repérés dans
+        # la Convention ou le CCTP. Les termes de l'outil restent disponibles
+        # dans ``glossaire_complet`` pour les infobulles, sans être présentés
+        # comme détectés dans le dossier.
+        gloss_list = [g for g in full_glossary if clean(g.get("page_doc", "")) and clean(g.get("source_doc", ""))]
+        global_ctx = _extraire_details_convention("GLOBAL", "", "", "", "", conv.text, args.lot, conv_pages=conv.pages, gloss=gloss, detections=detections, metadata_rules=metadata_rules)
+        meta = {
+            "projet": conv.name.replace(".pdf", ""), "nom_projet": args.nom_projet or conv_infos.get("operation", ""),
+            "entreprise": args.entreprise, "lot": args.lot, "marque": args.marque or args.entreprise,
+            "adresse": args.adresse, "email": args.email, "analyste": args.analyste,
+            "date": datetime.now().strftime("%d/%m/%Y"), "documents_analyses": docs,
+            "axes_config": axes_config, "restitution_rules": restitution_rules, "messages": messages,
+            "engine_params": engine_params, "contradictions": contradictions, "ccap_reperage": ccap_reperage,
+            "points_vigilance": points_vigilance,
+            "supplementary_documents": [clean(s.get("display_name")) for s in supplement_docs],
+            "n_pages_convention": len(conv.pages), "n_pgs": len(cctp.pages) if cctp else 0,
+            "indice_doc": conv_infos.get("indice", ""), "date_doc": conv_infos.get("date", ""),
+            "emetteur_doc": conv_infos.get("emetteur", ""), "maitre_ouvrage_doc": conv_infos.get("maitre_ouvrage", ""),
+            "maitrise_oeuvre_doc": conv_infos.get("maitrise_oeuvre", ""),
+            "cctp_nom": cctp_infos.get("nom_fichier", ""), "cctp_indice": cctp_infos.get("indice", ""),
+            "cctp_date": cctp_infos.get("date", ""), "cctp_auteur": cctp_infos.get("emetteur", ""), "cctp_phase": cctp_infos.get("phase", ""),
+            "niveau_bim": global_ctx.get("niveau_bim", ""), "bim_manager_conv": global_ctx.get("bim_manager", ""),
+            "coordinateur_bim_conv": global_ctx.get("coordinateur_bim", ""), "geo_referencement": global_ctx.get("geo_referencement", False),
+            "doe_numerique": global_ctx.get("doe_numerique", False), "formats_livrables": global_ctx.get("formats_livrables", ""),
+            "plateforme_conv": global_ctx.get("plateforme", ""), "plateforme_page": global_ctx.get("plateforme_page", ""),
+            "logiciel_conv": global_ctx.get("logiciel", ""),
+            "format_ifc_conv": global_ctx.get("format_ifc", ""),
+            "lod_conv": global_ctx.get("lod", ""), "lod_page": global_ctx.get("lod_page", ""),
+            "nd_conv": global_ctx.get("nd", ""), "nd_page": global_ctx.get("nd_page", ""),
+            "glossary_entries": glossary_entries_from_dataframe(filtrer_glossaire_detecte(gloss, all_text)),
+            **charger_logo(args.logo),
+        }
+        conv_b64 = base64.b64encode(conv_path.read_bytes()).decode("ascii")
+        cctp_b64 = base64.b64encode(Path(args.cctp).read_bytes()).decode("ascii") if cctp else ""
+        ccap_b64 = base64.b64encode(ccap_path.read_bytes()).decode("ascii") if ccap_path and ccap_path.exists() else ""
+        supplement_b64 = {
+            f"supp{int(s.get('index', 0))}": {
+                "name": clean(s.get("display_name")),
+                "b64": base64.b64encode(Path(s.get("path")).read_bytes()).decode("ascii"),
             }
-            # Encoder les PDF source en base64 pour la visionneuse intégrée
-            conv_b64 = base64.b64encode(conv_path.read_bytes()).decode("ascii")
-            cctp_b64 = ""
-            if cctp:
-                cctp_b64 = base64.b64encode(Path(args.cctp).read_bytes()).decode("ascii")
+            for s in supplement_docs
+        }
+        # Même principe pour le dashboard : on répare uniquement les chaînes
+        # affichées, après calcul des statuts et des règles métier.
+        results_display = _reparer_obj_affichage(results)
+        proposals_display = _reparer_obj_affichage(proposals)
+        meta_display = _reparer_obj_affichage(meta)
+        html_text = build_dashboard(
+            results_display, scores, proposals_display, gloss_list, meta_display, conv_text=_reparer_texte_affichage(conv.text),
+            conv_b64=conv_b64, cctp_b64=cctp_b64, ccap_b64=ccap_b64, supplement_b64=supplement_b64,
+            pdf_filename="", glossaire_complet=full_glossary,
+        )
+        html_path.write_text(html_text, encoding="utf-8")
+        print(f"Dashboard HTML généré : {html_path}")
 
-            # Substituer les {variables} détectées ({plateforme}, {cout}, {lot}...)
-            # dans TOUTES les colonnes de texte libre de 10_Blocs -- pas seulement
-            # question_bim_manager -- puis filtrer les questions BIM Manager déjà
-            # couvertes par les documents. Logique générique, rien dans le template :
-            # ajouter une {variable} dans l'Excel suffit, aucun code à modifier.
-            _ctx_glob_sub = {**_ctx_glob, "lot": args.lot}
-            _COLONNES_LIBRES = [
-                "description_convention", "lecture_entreprise", "risque_si_ignore",
-                "type_preuve_cctp_attendue", "interpretation_croisee",
-                "action_confirmee", "action_probable", "action_non_applicable",
-                "question_bim_manager",
-                "proposition_commerciale", "action_interne_standard",
-                "action_interne_capacite",
-            ]
-            for bid_f, res_f in resultats_lecture.items():
-                res_f["bloc"] = dict(res_f["bloc"])
-                for col in _COLONNES_LIBRES:
-                    res_f["bloc"][col] = _sub_ctx(str(res_f["bloc"].get(col, "")), _ctx_glob_sub)
-                q_filt = filtrer_question_bm(
-                    res_f["bloc"]["question_bim_manager"],
-                    res_f.get("conv_pf",""), res_f.get("cctp_pf",""),
-                    conv.text, args.lot
-                )
-                res_f["bloc"]["question_bim_manager"] = q_filt
-
-            # Nom du fichier PDF associé (même dossier, même base de nom)
-            pdf_filename = "" if args.web_only else out_path.with_suffix(".pdf").name
-            html_str = build_dashboard(
-                resultats_lecture, scores_eval, textes_reponse, gloss_list, meta,
-                conv_text=conv.text,
-                conv_b64=conv_b64, cctp_b64=cctp_b64,
-                pdf_filename=pdf_filename,
-                glossaire_complet=gloss_enrichi,
-            )
-            html_path.write_text(html_str, encoding="utf-8")
-            print(f"✓ Dashboard HTML généré : {html_path}")
-            # Écrire l'analyse dans l'historique 70_Entreprise
-            ecrire_historique(param, conv.name, args.lot, meta.get("score_reponse", 0))
 
 if __name__ == "__main__":
     main()
