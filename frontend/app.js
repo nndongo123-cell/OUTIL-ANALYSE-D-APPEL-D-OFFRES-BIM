@@ -929,12 +929,24 @@ function showPreAnalysisModal(check, evaluationText, options = {}) {
               <span>Je confirme explicitement avoir vérifié l'incohérence ou l'incertitude signalée et vouloir poursuivre malgré cette alerte.</span>
             </label>` : ""}`}
         </div>
-        <div class="precheck-actions">
-          <button type="button" class="precheck-cancel secondary-button">Retour aux documents</button>
-          <button type="button" class="precheck-launch">${hasBlocking ? "Analyse bloquée" : "Valider et lancer l'analyse"}</button>
+        <div class="precheck-footer">
+          <div class="precheck-confirmations" aria-label="Validations obligatoires"></div>
+          <div class="precheck-actions">
+            <button type="button" class="precheck-cancel secondary-button">Retour aux documents</button>
+            <button type="button" class="precheck-launch">${hasBlocking ? "Analyse bloquée" : "Valider et lancer l'analyse"}</button>
+          </div>
         </div>
       </section>`;
 
+    // DEV08 : déplacer les validations dans un pied fixe et verrouiller le scroll de la page arrière.
+    const confirmations = overlay.querySelector(".precheck-confirmations");
+    overlay.querySelectorAll(".precheck-body > .precheck-check, .precheck-body > .precheck-blocking-message").forEach(node => confirmations?.appendChild(node));
+    const previousBodyOverflow = document.body.style.overflow;
+    const previousBodyPaddingRight = document.body.style.paddingRight;
+    const scrollbarGap = Math.max(0, window.innerWidth - document.documentElement.clientWidth);
+    if (scrollbarGap) document.body.style.paddingRight = `${scrollbarGap}px`;
+    document.body.style.overflow = "hidden";
+    document.body.classList.add("precheck-open");
     document.body.appendChild(overlay);
     const launch = overlay.querySelector(".precheck-launch");
     const cancel = overlay.querySelector(".precheck-cancel");
@@ -960,6 +972,9 @@ function showPreAnalysisModal(check, evaluationText, options = {}) {
       closed = true;
       document.removeEventListener("keydown", onKey);
       overlay.remove();
+      document.body.classList.remove("precheck-open");
+      document.body.style.overflow = previousBodyOverflow;
+      document.body.style.paddingRight = previousBodyPaddingRight;
       resolve(value);
     };
     const onKey = event => { if (event.key === "Escape") finish(null); };
