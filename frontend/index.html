@@ -19,6 +19,11 @@
         <div class="section-title"><span>1</span><h2>Documents et contexte</h2></div>
         <div class="grid two">
           <label class="field">
+            <span>Nom du projet <b>*</b></span>
+            <input type="text" name="projet" id="projet-field" placeholder="Détecté automatiquement après sélection de la convention, modifiable" required>
+            <small id="projet-status">Sera pré-rempli dès que la Convention BIM est chargée — à vérifier avant de lancer l’analyse.</small>
+          </label>
+          <label class="field">
             <span><span class="static-term" data-term="Convention BIM">Convention BIM</span> <b>*</b></span>
             <input type="file" name="convention" accept="application/pdf,.pdf" required>
             <div class="file-status-row"><small id="convention-file-status">PDF obligatoire</small><button class="file-clear-button" type="button" data-clear-file="convention" disabled aria-disabled="true">Décharger</button></div>
@@ -35,15 +40,23 @@
           </label>
           <label class="field">
             <span>Entreprise</span>
-            <input type="text" name="entreprise" placeholder="Nom de l’entreprise">
+            <input type="text" name="entreprise" placeholder="Nom de l’entreprise — affiché en en-tête des documents">
           </label>
           <label class="field">
             <span>Lot analysé <b>*</b></span>
             <input type="text" name="lot" placeholder="Ex. Façade et bardage" required>
           </label>
           <label class="field">
-            <span>Sigle affiché en en-tête des documents</span>
-            <input type="text" name="marque" placeholder="Ex. BNN (par défaut : nom de l’entreprise)">
+            <span>Adresse</span>
+            <input type="text" name="adresse" placeholder="Ex. 3 Rue Thimonnier, 42100 Saint-Étienne">
+          </label>
+          <label class="field">
+            <span>Email</span>
+            <input type="email" name="email" placeholder="contact@entreprise.fr">
+          </label>
+          <label class="field">
+            <span>Analyse réalisée par</span>
+            <input type="text" name="analyste" placeholder="Nom de la personne ayant réalisé l’analyse">
           </label>
           <label class="field">
             <span>Logo (facultatif, inséré dans tous les documents)</span>

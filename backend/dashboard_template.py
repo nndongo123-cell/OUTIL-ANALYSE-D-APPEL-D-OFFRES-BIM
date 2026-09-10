@@ -519,8 +519,16 @@ def build_dashboard(
         radar_svg = f'<div class="empty-radar">{esc(_radar_empty)}</div>'
 
     project_rows = [
-        ("Projet", meta.get("projet") or "-"), ("Entreprise", meta.get("entreprise") or "-"),
+        ("Projet", meta.get("nom_projet") or meta.get("projet") or "-"), ("Entreprise", meta.get("entreprise") or "-"),
         ("Lot analysé", meta.get("lot") or "-"), ("Édition", meta.get("date") or "-"),
+    ]
+    if meta.get("adresse"):
+        project_rows.append(("Adresse", meta.get("adresse")))
+    if meta.get("email"):
+        project_rows.append(("Email", meta.get("email")))
+    if meta.get("analyste"):
+        project_rows.append(("Analyse réalisée par", meta.get("analyste")))
+    project_rows += [
         ("Maître d'ouvrage", meta.get("maitre_ouvrage_doc") or "Non détecté"),
         ("Maîtrise d'œuvre", meta.get("maitrise_oeuvre_doc") or "Non détectée"),
         ("BIM Manager", meta.get("bim_manager_conv") or "Non détecté"),
